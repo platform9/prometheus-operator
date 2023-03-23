@@ -12,7 +12,7 @@ require (
 	github.com/go-openapi/swag v0.19.12
 	github.com/gogo/protobuf v1.3.2
 	github.com/golang/protobuf v1.4.3
-	github.com/google/go-cmp v0.5.4
+	github.com/google/go-cmp v0.5.5
 	github.com/hashicorp/go-version v1.2.1
 	github.com/kylelemons/godebug v1.1.0
 	github.com/mitchellh/hashstructure v1.0.1-0.20200508175121-8fdbea448aa6
@@ -22,8 +22,8 @@ require (
 	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.46.0
 	github.com/prometheus-operator/prometheus-operator/pkg/client v0.46.0
 	github.com/prometheus/alertmanager v0.21.1-0.20200911160112-1fdff6b3f939
-	github.com/prometheus/client_golang v1.9.0
-	github.com/prometheus/common v0.15.0
+	github.com/prometheus/client_golang v1.11.1
+	github.com/prometheus/common v0.26.0
 	github.com/prometheus/prometheus v1.8.2-0.20210106134434-02e92236a8ba
 	github.com/stretchr/testify v1.6.1
 	github.com/thanos-io/thanos v0.17.2
