@@ -22,7 +22,7 @@ require (
 	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.46.0
 	github.com/prometheus-operator/prometheus-operator/pkg/client v0.46.0
 	github.com/prometheus/alertmanager v0.21.1-0.20200911160112-1fdff6b3f939
-	github.com/prometheus/client_golang v1.11.1
+	github.com/prometheus/client_golang v1.9.0
 	github.com/prometheus/common v0.26.0
 	github.com/prometheus/prometheus v1.8.2-0.20210106134434-02e92236a8ba
 	github.com/stretchr/testify v1.6.1
