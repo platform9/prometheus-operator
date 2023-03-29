@@ -27,7 +27,7 @@ require (
 	github.com/prometheus/prometheus v1.8.2-0.20210106134434-02e92236a8ba
 	github.com/stretchr/testify v1.6.1
 	github.com/thanos-io/thanos v0.17.2
-	golang.org/x/sync v0.0.0-20201207232520-09787c993a3a
+	golang.org/x/sync v0.1.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
 	k8s.io/api v0.20.1
@@ -92,13 +92,13 @@ require (
 	go.uber.org/goleak v1.1.10 // indirect
 	golang.org/x/crypto v0.0.0-20220314234659-1baeb1ce4c0b // indirect
 	golang.org/x/lint v0.0.0-20200302205851-738671d3881b // indirect
-	golang.org/x/net v0.0.0-20201224014010-6772e930b67b // indirect
+	golang.org/x/net v0.8.0 // indirect
 	golang.org/x/oauth2 v0.0.0-20201208152858-08078c50e5b5 // indirect
-	golang.org/x/sys v0.0.0-20201223074533-0d417f636930 // indirect
-	golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1 // indirect
-	golang.org/x/text v0.3.4 // indirect
+	golang.org/x/sys v0.6.0 // indirect
+	golang.org/x/term v0.6.0 // indirect
+	golang.org/x/text v0.8.0 // indirect
 	golang.org/x/time v0.0.0-20201208040808-7e3f01d25324 // indirect
-	golang.org/x/tools v0.0.0-20210106214847-113979e3529a // indirect
+	golang.org/x/tools v0.6.0 // indirect
 	google.golang.org/appengine v1.6.7 // indirect
 	google.golang.org/protobuf v1.25.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
