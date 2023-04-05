@@ -28,7 +28,7 @@ WORKDIR /go/src/github.com/prometheus-operator/prometheus-operator
 COPY . .
 RUN GO111MODULE=on make po-lint && chmod +x po-lint && mv po-lint /go/bin/
 
-FROM golang:1.19.7
+FROM golang:1.19.8
 RUN apt-get update -y && apt-get install -y make git jq gawk python-yaml && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/jsonnetfmt /usr/local/bin/jsonnetfmt
