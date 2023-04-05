@@ -1,4 +1,4 @@
-FROM golang:1.19.7 as builder
+FROM golang:1.19.8 as builder
 
 ENV JSONNET_VERSION v0.15.0
 # This corresponds to v2.16.0, but needs to be written as commit hash due to golang 1.13 issues
