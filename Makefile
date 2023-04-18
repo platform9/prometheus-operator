@@ -66,6 +66,16 @@ pkgs = $(shell go list ./... | grep -v /test/ | grep -v /contrib/)
 pkgs += $(shell go list $(GO_PKG)/pkg/apis/monitoring...)
 pkgs += $(shell go list $(GO_PKG)/pkg/client...)
 
+BUILDDIR=$(CURDIR)
+registry_url ?= docker.io
+image_name_operator = ${registry_url}/platform9/prometheus-operator
+image_name_reloader = ${registry_url}/platform9/prometheus-config-reloader
+DOCKERFILE?=$(CURDIR)/Dockerfile
+UPSTREAM_VERSION?=$(shell cat ./VERSION)
+image_tag = $(UPSTREAM_VERSION)-pmk-$(TEAMCITY_BUILD_ID)
+PF9_TAG_OPERATOR="$(image_name_operator):${image_tag}"
+PF9_TAG_RELOADER="$(image_name_reloader):${image_tag}"
+
 .PHONY: all
 all: format generate build test
 
@@ -299,3 +309,30 @@ $(TOOLS_BIN_DIR)/$(1):
 endef
 
 $(foreach binary,$(K8S_GEN_BINARIES),$(eval $(call _K8S_GEN_VAR_TARGET_,$(binary))))
+
+
+
+.hack-operator-image-pf9: Dockerfile operator
+# Create empty target file, for the sole purpose of recording when this target
+# was last executed via the last-modification timestamp on the file. See
+# https://www.gnu.org/software/make/manual/make.html#Empty-Targets
+	docker build --build-arg ARCH=$(ARCH) --build-arg OS=amd64 -t $(PF9_TAG_OPERATOR) .
+	touch $@
+
+.hack-prometheus-config-reloader-image-pf9: cmd/prometheus-config-reloader/Dockerfile prometheus-config-reloader
+# Create empty target file, for the sole purpose of recording when this target
+# was last executed via the last-modification timestamp on the file. See
+# https://www.gnu.org/software/make/manual/make.html#Empty-Targets
+	docker build --build-arg ARCH=$(ARCH) --build-arg OS=amd64 -t $(PF9_TAG_RELOADER) -f cmd/prometheus-config-reloader/Dockerfile .
+	touch $@
+
+pf9-image: .hack-operator-image-pf9 .hack-prometheus-config-reloader-image-pf9
+
+pf9-push:
+	echo $(PF9_TAG_OPERATOR) >> $(BUILDDIR)/container-tag
+	echo $(PF9_TAG_RELOADER) >> $(BUILDDIR)/container-tag
+	docker login
+	docker push $(PF9_TAG_OPERATOR)\
+	&& docker rmi $(PF9_TAG_OPERATOR)
+	docker push $(PF9_TAG_RELOADER)\
+	&& docker rmi $(PF9_TAG_RELOADER)
