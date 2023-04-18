@@ -316,14 +316,14 @@ $(foreach binary,$(K8S_GEN_BINARIES),$(eval $(call _K8S_GEN_VAR_TARGET_,$(binary
 # Create empty target file, for the sole purpose of recording when this target
 # was last executed via the last-modification timestamp on the file. See
 # https://www.gnu.org/software/make/manual/make.html#Empty-Targets
-	docker build --build-arg ARCH=$(ARCH) --build-arg OS=amd64 -t $(PF9_TAG_OPERATOR) .
+	docker build --build-arg ARCH=$(ARCH) --build-arg OS=linux -t $(PF9_TAG_OPERATOR) .
 	touch $@
 
 .hack-prometheus-config-reloader-image-pf9: cmd/prometheus-config-reloader/Dockerfile prometheus-config-reloader
 # Create empty target file, for the sole purpose of recording when this target
 # was last executed via the last-modification timestamp on the file. See
 # https://www.gnu.org/software/make/manual/make.html#Empty-Targets
-	docker build --build-arg ARCH=$(ARCH) --build-arg OS=amd64 -t $(PF9_TAG_RELOADER) -f cmd/prometheus-config-reloader/Dockerfile .
+	docker build --build-arg ARCH=$(ARCH) --build-arg OS=linux -t $(PF9_TAG_RELOADER) -f cmd/prometheus-config-reloader/Dockerfile .
 	touch $@
 
 pf9-image: .hack-operator-image-pf9 .hack-prometheus-config-reloader-image-pf9
