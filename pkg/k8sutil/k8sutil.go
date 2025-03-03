@@ -25,26 +25,34 @@ import (
 	"strings"
 
 	"github.com/cespare/xxhash/v2"
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	monitoringv1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
-	monitoringv1beta1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1beta1"
 	promversion "github.com/prometheus/common/version"
 	appsv1 "k8s.io/api/apps/v1"
+	authv1 "k8s.io/api/authorization/v1"
 	v1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/discovery"
 	clientappsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
+	clientauthv1 "k8s.io/client-go/kubernetes/typed/authorization/v1"
 	clientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	clientdiscoveryv1 "k8s.io/client-go/kubernetes/typed/discovery/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	monitoringv1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
+	monitoringv1beta1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1beta1"
 )
 
-// KubeConfigEnv (optionally) specify the location of kubeconfig file
+// KubeConfigEnv (optionally) specify the location of kubeconfig file.
 const KubeConfigEnv = "KUBECONFIG"
 
 var invalidDNS1123Characters = regexp.MustCompile("[^-a-z0-9]+")
@@ -52,9 +60,9 @@ var invalidDNS1123Characters = regexp.MustCompile("[^-a-z0-9]+")
 var scheme = runtime.NewScheme()
 
 func init() {
-	_ = monitoringv1.SchemeBuilder.AddToScheme(scheme)
-	_ = monitoringv1alpha1.SchemeBuilder.AddToScheme(scheme)
-	_ = monitoringv1beta1.SchemeBuilder.AddToScheme(scheme)
+	utilruntime.Must(monitoringv1.SchemeBuilder.AddToScheme(scheme))
+	utilruntime.Must(monitoringv1alpha1.SchemeBuilder.AddToScheme(scheme))
+	utilruntime.Must(monitoringv1beta1.SchemeBuilder.AddToScheme(scheme))
 }
 
 // PodRunningAndReady returns whether a pod is running and each container has
@@ -62,7 +70,7 @@ func init() {
 func PodRunningAndReady(pod v1.Pod) (bool, error) {
 	switch pod.Status.Phase {
 	case v1.PodFailed, v1.PodSucceeded:
-		return false, fmt.Errorf("pod completed")
+		return false, fmt.Errorf("pod completed with phase %s", pod.Status.Phase)
 	case v1.PodRunning:
 		for _, cond := range pod.Status.Conditions {
 			if cond.Type != v1.PodReady {
@@ -75,33 +83,42 @@ func PodRunningAndReady(pod v1.Pod) (bool, error) {
 	return false, nil
 }
 
-func NewClusterConfig(host string, tlsInsecure bool, tlsConfig *rest.TLSClientConfig) (*rest.Config, error) {
+type ClusterConfig struct {
+	Host           string
+	TLSConfig      rest.TLSClientConfig
+	AsUser         string
+	KubeconfigPath string
+}
+
+func NewClusterConfig(config ClusterConfig) (*rest.Config, error) {
 	var cfg *rest.Config
 	var err error
 
-	kubeconfigPath := os.Getenv(KubeConfigEnv)
-	if kubeconfigPath != "" {
+	if config.KubeconfigPath == "" {
+		config.KubeconfigPath = os.Getenv(KubeConfigEnv)
+	}
+
+	if config.KubeconfigPath != "" {
 		loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 		cfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{}).ClientConfig()
 		if err != nil {
-			return nil, fmt.Errorf("error creating config from %s: %w", kubeconfigPath, err)
+			return nil, fmt.Errorf("error creating config from %s: %w", config.KubeconfigPath, err)
 		}
 	} else {
-		if len(host) == 0 {
+		if len(config.Host) == 0 {
 			if cfg, err = rest.InClusterConfig(); err != nil {
 				return nil, err
 			}
 		} else {
 			cfg = &rest.Config{
-				Host: host,
+				Host: config.Host,
 			}
-			hostURL, err := url.Parse(host)
+			hostURL, err := url.Parse(config.Host)
 			if err != nil {
-				return nil, fmt.Errorf("error parsing host url %s: %w", host, err)
+				return nil, fmt.Errorf("error parsing host url %s: %w", config.Host, err)
 			}
 			if hostURL.Scheme == "https" {
-				cfg.TLSClientConfig = *tlsConfig
-				cfg.Insecure = tlsInsecure
+				cfg.TLSClientConfig = config.TLSConfig
 			}
 		}
 	}
@@ -110,8 +127,96 @@ func NewClusterConfig(host string, tlsInsecure bool, tlsConfig *rest.TLSClientCo
 	cfg.Burst = 100
 
 	cfg.UserAgent = fmt.Sprintf("PrometheusOperator/%s", promversion.Version)
+	cfg.Impersonate.UserName = config.AsUser
 
 	return cfg, nil
+}
+
+// ResourceAttribute represents authorization attributes to check on a given resource.
+type ResourceAttribute struct {
+	Resource string
+	Name     string
+	Group    string
+	Version  string
+	Verbs    []string
+}
+
+// IsAllowed returns whether the user (e.g. the operator's service account) has
+// been granted the required RBAC attributes.
+// It returns true when the conditions are met for the namespaces (an empty
+// namespace value means "all").
+// The second return value returns the list of permissions that are missing if
+// the requirements aren't met.
+func IsAllowed(
+	ctx context.Context,
+	ssarClient clientauthv1.SelfSubjectAccessReviewInterface,
+	namespaces []string,
+	attributes ...ResourceAttribute,
+) (bool, []error, error) {
+	if len(attributes) == 0 {
+		return false, nil, fmt.Errorf("resource attributes must not be empty")
+	}
+
+	if len(namespaces) == 0 {
+		namespaces = []string{v1.NamespaceAll}
+	}
+
+	var missingPermissions []error
+	for _, ns := range namespaces {
+		for _, ra := range attributes {
+			for _, verb := range ra.Verbs {
+				resourceAttributes := authv1.ResourceAttributes{
+					Verb:     verb,
+					Group:    ra.Group,
+					Version:  ra.Version,
+					Resource: ra.Resource,
+					// An empty name value means "all" resources.
+					Name: ra.Name,
+					// An empty namespace value means "all" for namespace-scoped resources.
+					Namespace: ns,
+				}
+
+				// Special case for SAR on namespaces resources: Namespace and
+				// Name need to be equal.
+				if resourceAttributes.Group == "" && resourceAttributes.Resource == "namespaces" && resourceAttributes.Name != "" && resourceAttributes.Namespace == "" {
+					resourceAttributes.Namespace = resourceAttributes.Name
+				}
+
+				ssar := &authv1.SelfSubjectAccessReview{
+					Spec: authv1.SelfSubjectAccessReviewSpec{
+						ResourceAttributes: &resourceAttributes,
+					},
+				}
+
+				// FIXME(simonpasquier): retry in case of server-side errors.
+				ssarResponse, err := ssarClient.Create(ctx, ssar, metav1.CreateOptions{})
+				if err != nil {
+					return false, nil, err
+				}
+
+				if !ssarResponse.Status.Allowed {
+					var (
+						reason   error
+						resource = ra.Resource
+					)
+					if ra.Name != "" {
+						resource += "/" + ra.Name
+					}
+
+					switch {
+					case ns == v1.NamespaceAll:
+						reason = fmt.Errorf("missing %q permission on resource %q (group: %q) for all namespaces", verb, resource, ra.Group)
+					default:
+						reason = fmt.Errorf("missing %q permission on resource %q (group: %q) for namespace %q", verb, resource, ra.Group, ns)
+					}
+
+					missingPermissions = append(missingPermissions, reason)
+				}
+			}
+		}
+	}
+
+	return len(missingPermissions) == 0, missingPermissions, nil
 }
 
 func IsResourceNotFoundError(err error) bool {
@@ -119,22 +224,26 @@ func IsResourceNotFoundError(err error) bool {
 	if !ok {
 		return false
 	}
+
 	if se.Status().Code == http.StatusNotFound && se.Status().Reason == metav1.StatusReasonNotFound {
 		return true
 	}
+
 	return false
 }
 
-func CreateOrUpdateService(ctx context.Context, sclient clientv1.ServiceInterface, svc *v1.Service) error {
+func CreateOrUpdateService(ctx context.Context, sclient clientv1.ServiceInterface, svc *v1.Service) (*v1.Service, error) {
+	var ret *v1.Service
+
 	// As stated in the RetryOnConflict's documentation, the returned error shouldn't be wrapped.
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		service, err := sclient.Get(ctx, svc.Name, metav1.GetOptions{})
 		if err != nil {
 			if !apierrors.IsNotFound(err) {
 				return err
 			}
 
-			_, err = sclient.Create(ctx, svc, metav1.CreateOptions{})
+			ret, err = sclient.Create(ctx, svc, metav1.CreateOptions{})
 			return err
 		}
 
@@ -147,9 +256,11 @@ func CreateOrUpdateService(ctx context.Context, sclient clientv1.ServiceInterfac
 		svc.SetOwnerReferences(mergeOwnerReferences(service.GetOwnerReferences(), svc.GetOwnerReferences()))
 		mergeMetadata(&svc.ObjectMeta, service.ObjectMeta)
 
-		_, err = sclient.Update(ctx, svc, metav1.UpdateOptions{})
+		ret, err = sclient.Update(ctx, svc, metav1.UpdateOptions{})
 		return err
 	})
+
+	return ret, err
 }
 
 func CreateOrUpdateEndpoints(ctx context.Context, eclient clientv1.EndpointsInterface, eps *v1.Endpoints) error {
@@ -172,6 +283,31 @@ func CreateOrUpdateEndpoints(ctx context.Context, eclient clientv1.EndpointsInte
 	})
 }
 
+func CreateOrUpdateEndpointSlice(ctx context.Context, c clientdiscoveryv1.EndpointSliceInterface, eps *discoveryv1.EndpointSlice) error {
+	// As stated in the RetryOnConflict's documentation, the returned error shouldn't be wrapped.
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if eps.Name == "" {
+			_, err := c.Create(ctx, eps, metav1.CreateOptions{})
+			return err
+		}
+
+		endpoints, err := c.Get(ctx, eps.Name, metav1.GetOptions{})
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				return err
+			}
+
+			_, err = c.Create(ctx, eps, metav1.CreateOptions{})
+			return err
+		}
+
+		mergeMetadata(&eps.ObjectMeta, endpoints.ObjectMeta)
+
+		_, err = c.Update(ctx, eps, metav1.UpdateOptions{})
+		return err
+	})
+}
+
 // UpdateStatefulSet merges metadata of existing StatefulSet with new one and updates it.
 func UpdateStatefulSet(ctx context.Context, sstClient clientappsv1.StatefulSetInterface, sset *appsv1.StatefulSet) error {
 	// As stated in the RetryOnConflict's documentation, the returned error shouldn't be wrapped.
@@ -186,6 +322,24 @@ func UpdateStatefulSet(ctx context.Context, sstClient clientappsv1.StatefulSetIn
 		mergeKubectlAnnotations(&existingSset.Spec.Template.ObjectMeta, sset.Spec.Template.ObjectMeta)
 
 		_, err = sstClient.Update(ctx, sset, metav1.UpdateOptions{})
+		return err
+	})
+}
+
+// UpdateDaemonSet merges metadata of existing DaemonSet with new one and updates it.
+func UpdateDaemonSet(ctx context.Context, dmsClient clientappsv1.DaemonSetInterface, dset *appsv1.DaemonSet) error {
+	// As stated in the RetryOnConflict's documentation, the returned error shouldn't be wrapped.
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		existingDset, err := dmsClient.Get(ctx, dset.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		mergeMetadata(&dset.ObjectMeta, existingDset.ObjectMeta)
+		// Propagate annotations set by kubectl on spec.template.annotations. e.g performing a rolling restart.
+		mergeKubectlAnnotations(&existingDset.Spec.Template.ObjectMeta, dset.Spec.Template.ObjectMeta)
+
+		_, err = dmsClient.Update(ctx, dset, metav1.UpdateOptions{})
 		return err
 	})
 }
@@ -215,14 +369,13 @@ func CreateOrUpdateSecret(ctx context.Context, secretClient clientv1.SecretInter
 }
 
 // IsAPIGroupVersionResourceSupported checks if given groupVersion and resource is supported by the cluster.
-//
-// you can exec `kubectl api-resources` to find groupVersion and resource.
-func IsAPIGroupVersionResourceSupported(discoveryCli discovery.DiscoveryInterface, groupversion string, resource string) (bool, error) {
-	apiResourceList, err := discoveryCli.ServerResourcesForGroupVersion(groupversion)
+func IsAPIGroupVersionResourceSupported(discoveryCli discovery.DiscoveryInterface, groupVersion schema.GroupVersion, resource string) (bool, error) {
+	apiResourceList, err := discoveryCli.ServerResourcesForGroupVersion(groupVersion.String())
 	if err != nil {
 		if IsResourceNotFoundError(err) {
 			return false, nil
 		}
+
 		return false, err
 	}
 
@@ -231,6 +384,7 @@ func IsAPIGroupVersionResourceSupported(discoveryCli discovery.DiscoveryInterfac
 			return true, nil
 		}
 	}
+
 	return false, nil
 }
 
@@ -384,4 +538,61 @@ func mergeMapsByPrefix(from map[string]string, to map[string]string, prefix stri
 	}
 
 	return to
+}
+
+func UpdateDNSConfig(podSpec *v1.PodSpec, config *monitoringv1.PodDNSConfig) {
+	if config == nil {
+		return
+	}
+
+	dnsConfig := v1.PodDNSConfig{
+		Nameservers: config.Nameservers,
+		Searches:    config.Searches,
+	}
+
+	for _, opt := range config.Options {
+		dnsConfig.Options = append(dnsConfig.Options, v1.PodDNSConfigOption{
+			Name:  opt.Name,
+			Value: opt.Value,
+		})
+	}
+
+	podSpec.DNSConfig = &dnsConfig
+}
+
+func UpdateDNSPolicy(podSpec *v1.PodSpec, dnsPolicy *monitoringv1.DNSPolicy) {
+	if dnsPolicy == nil {
+		return
+	}
+
+	podSpec.DNSPolicy = v1.DNSPolicy(*dnsPolicy)
+}
+
+// This function is responsible for the following:
+//
+// Verify that the service exists in the resource's namespace
+// If it does not exist, fail the reconciliation.
+//
+// If the ServiceName is specified and a service with the same name exists in the same namespace as the
+// resource, ensure that the custom governing service's selector matches the
+// labels.
+// If it is not selected, fail the reconciliation
+// Warning: the function will panic if the resource's ServiceName is nil..
+func EnsureCustomGoverningService(ctx context.Context, namespace string, serviceName string, svcClient clientv1.ServiceInterface, selectorLabels map[string]string) error {
+	// Check if the custom governing service is defined in the same namespace and selects the Prometheus pod.
+	svc, err := svcClient.Get(ctx, serviceName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get custom governing service %s/%s: %w", namespace, serviceName, err)
+	}
+
+	svcSelector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: svc.Spec.Selector})
+	if err != nil {
+		return fmt.Errorf("failed to parse the selector labels for custom governing service %s/%s: %w", namespace, serviceName, err)
+	}
+
+	if !svcSelector.Matches(labels.Set(selectorLabels)) {
+		return fmt.Errorf("custom governing service %s/%s with selector %q does not select pods with labels %q",
+			namespace, serviceName, svcSelector.String(), labels.Set(selectorLabels).String())
+	}
+	return nil
 }

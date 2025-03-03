@@ -24,7 +24,7 @@ import (
 // ValidateURL against the config.URL
 // This could potentially become a regex and be validated via OpenAPI
 // but right now, since we know we need to unmarshal into an upstream type
-// after conversion, we validate we don't error when doing so
+// after conversion, we validate we don't error when doing so.
 func ValidateURL(url string) (*config.URL, error) {
 	var u config.URL
 	err := json.Unmarshal([]byte(fmt.Sprintf(`"%s"`, url)), &u)
@@ -32,4 +32,18 @@ func ValidateURL(url string) (*config.URL, error) {
 		return nil, fmt.Errorf("validate url from string failed for %s: %w", url, err)
 	}
 	return &u, nil
+}
+
+// ValidateSecretURL against config.URL
+// This is for URLs which are retrieved from secrets and should not
+// logged as part of the err.
+func ValidateSecretURL(url string) error {
+	var u config.SecretURL
+
+	err := u.UnmarshalJSON([]byte(fmt.Sprintf(`"%s"`, url)))
+	if err != nil {
+		return fmt.Errorf("validate url from string failed with error: %w", err)
+	}
+
+	return nil
 }
