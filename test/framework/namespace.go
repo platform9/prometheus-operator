@@ -17,14 +17,13 @@ package framework
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"testing"
 
-	"github.com/pkg/errors"
-	"github.com/prometheus-operator/prometheus-operator/pkg/k8sutil"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/prometheus-operator/prometheus-operator/pkg/k8sutil"
 )
 
 func (f *Framework) CreateNamespace(ctx context.Context, t *testing.T, testCtx *TestCtx) string {
@@ -32,18 +31,20 @@ func (f *Framework) CreateNamespace(ctx context.Context, t *testing.T, testCtx *
 	rn := k8sutil.ResourceNamer{}
 	name, err := rn.UniqueDNS1123Label(name)
 	if err != nil {
-		t.Fatal(errors.Wrap(err, fmt.Sprintf("failed to generate a namespace name %v", name)))
+		t.Fatalf("failed to generate namespace %v: %v", name, err)
 	}
 
 	_, err = f.KubeClient.CoreV1().Namespaces().Create(ctx, &v1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
+			Name:   name,
+			Labels: map[string]string{"app.kubernetes.io/created-by": "e2e-test"},
 		},
 	}, metav1.CreateOptions{})
-
 	if err != nil {
-		t.Fatal(errors.Wrap(err, fmt.Sprintf("failed to create namespace with name %v", name)))
+		t.Fatalf("failed to create namespace %q: %v", name, err)
 	}
+
+	testCtx.namespaces = append(testCtx.namespaces, name)
 
 	namespaceFinalizerFn := func() error {
 		return f.DeleteNamespace(ctx, name)

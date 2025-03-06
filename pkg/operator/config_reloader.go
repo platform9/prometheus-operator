@@ -17,19 +17,37 @@ package operator
 import (
 	"fmt"
 	"net/url"
+	"path"
 	"strconv"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 )
 
-const configReloaderPort = 8080
+const (
+	configReloaderPort     = 8080
+	initConfigReloaderPort = 8081
+
+	// ShardEnvVar is the name of the environment variable injected into the
+	// config-reloader container that contains the shard number.
+	ShardEnvVar = "SHARD"
+
+	// PodNameEnvVar is the name of the environment variable injected in the
+	// config-reloader container that contains the pod name.
+	PodNameEnvVar = "POD_NAME"
+
+	// NodeNameEnvVar is the name of the environment variable injected in the
+	// config-reloader container that contains the node name.
+	NodeNameEnvVar = "NODE_NAME"
+)
 
 // ConfigReloader contains the options to configure
-// a config-reloader container
+// a config-reloader container.
 type ConfigReloader struct {
 	name               string
 	config             ContainerConfig
+	webConfigFile      string
 	configFile         string
 	configEnvsubstFile string
 	imagePullPolicy    v1.PullPolicy
@@ -38,102 +56,136 @@ type ConfigReloader struct {
 	logFormat          string
 	logLevel           string
 	reloadURL          url.URL
-	runOnce            bool
+	runtimeInfoURL     url.URL
+	initContainer      bool
 	shard              *int32
 	volumeMounts       []v1.VolumeMount
 	watchedDirectories []string
+	useSignal          bool
+	withNodeNameEnv    bool
 }
 
 type ReloaderOption = func(*ConfigReloader)
 
-// ReloaderRunOnce sets the runOnce option for the config-reloader container
-func ReloaderRunOnce() ReloaderOption {
+func ReloaderUseSignal() ReloaderOption {
 	return func(c *ConfigReloader) {
-		c.runOnce = true
+		c.useSignal = true
 	}
 }
 
-// WatchedDirectories sets the watchedDirectories option for the config-reloader container
+// InitContainer runs the config-reloader program as an init container meaning
+// that it exits right after generating the configuration.
+func InitContainer() ReloaderOption {
+	return func(c *ConfigReloader) {
+		c.initContainer = true
+	}
+}
+
+// WatchedDirectories sets the watchedDirectories option for the config-reloader container.
 func WatchedDirectories(watchedDirectories []string) ReloaderOption {
 	return func(c *ConfigReloader) {
 		c.watchedDirectories = watchedDirectories
 	}
 }
 
-// ConfigFile sets the configFile option for the config-reloader container
+// WebConfigFile sets the webConfigFile option for the config-reloader container.
+func WebConfigFile(config string) ReloaderOption {
+	return func(c *ConfigReloader) {
+		c.webConfigFile = config
+	}
+}
+
+// ConfigFile sets the configFile option for the config-reloader container.
 func ConfigFile(configFile string) ReloaderOption {
 	return func(c *ConfigReloader) {
 		c.configFile = configFile
 	}
 }
 
-// ConfigEnvsubstFile sets the configEnvsubstFile option for the config-reloader container
+// ConfigEnvsubstFile sets the configEnvsubstFile option for the config-reloader container.
 func ConfigEnvsubstFile(configEnvsubstFile string) ReloaderOption {
 	return func(c *ConfigReloader) {
 		c.configEnvsubstFile = configEnvsubstFile
 	}
 }
 
-// ReloaderResources sets the config option for the config-reloader container
+// ReloaderConfig sets the config option for the config-reloader container.
 func ReloaderConfig(rc ContainerConfig) ReloaderOption {
 	return func(c *ConfigReloader) {
 		c.config = rc
 	}
 }
 
-// ReloaderURL sets the reloaderURL option for the config-reloader container
-func ReloaderURL(reloadURL url.URL) ReloaderOption {
+// ReloaderURL sets the reloaderURL option for the config-reloader container.
+func ReloaderURL(u url.URL) ReloaderOption {
 	return func(c *ConfigReloader) {
-		c.reloadURL = reloadURL
+		c.reloadURL = u
 	}
 }
 
-// ListenLocal sets the listenLocal option for the config-reloader container
+// RuntimeInfoURL sets the runtimeInfoURL option for the config-reloader container.
+func RuntimeInfoURL(u url.URL) ReloaderOption {
+	return func(c *ConfigReloader) {
+		c.runtimeInfoURL = u
+	}
+}
+
+// ListenLocal sets the listenLocal option for the config-reloader container.
 func ListenLocal(listenLocal bool) ReloaderOption {
 	return func(c *ConfigReloader) {
 		c.listenLocal = listenLocal
 	}
 }
 
-// LocalHost sets the localHost option for the config-reloader container
+// LocalHost sets the localHost option for the config-reloader container.
 func LocalHost(localHost string) ReloaderOption {
 	return func(c *ConfigReloader) {
 		c.localHost = localHost
 	}
 }
 
-// LogFormat sets the logFormat option for the config-reloader container
+// LogFormat sets the logFormat option for the config-reloader container.
 func LogFormat(logFormat string) ReloaderOption {
 	return func(c *ConfigReloader) {
 		c.logFormat = logFormat
 	}
 }
 
-// LogLevel sets the logLevel option for the config-reloader container\
+// LogLevel sets the logLevel option for the config-reloader container.
 func LogLevel(logLevel string) ReloaderOption {
 	return func(c *ConfigReloader) {
 		c.logLevel = logLevel
 	}
 }
 
-// VolumeMounts sets the volumeMounts option for the config-reloader container
+// VolumeMounts sets the volumeMounts option for the config-reloader container.
 func VolumeMounts(mounts []v1.VolumeMount) ReloaderOption {
 	return func(c *ConfigReloader) {
 		c.volumeMounts = mounts
 	}
 }
 
-// Shard sets the shard option for the config-reloader container
+// Shard sets the shard option for the config-reloader container.
 func Shard(shard int32) ReloaderOption {
 	return func(c *ConfigReloader) {
 		c.shard = &shard
 	}
 }
 
-// ImagePullPolicy sets the imagePullPolicy option for the config-reloader container
+// ImagePullPolicy sets the imagePullPolicy option for the config-reloader container.
 func ImagePullPolicy(imagePullPolicy v1.PullPolicy) ReloaderOption {
 	return func(c *ConfigReloader) {
 		c.imagePullPolicy = imagePullPolicy
+	}
+}
+
+// DaemonSet sets the options that work for DaemonSet mode.
+// Currently we set SHARD env equal to 0, eventhough DaemonSet doesn't use this env.
+// TODO: Remove SHARD env for DaemonSet mode.
+func WithDaemonSetMode() ReloaderOption {
+	return func(c *ConfigReloader) {
+		c.withNodeNameEnv = true
+		c.shard = ptr.To(int32(0))
 	}
 }
 
@@ -150,7 +202,7 @@ func CreateConfigReloader(name string, options ...ReloaderOption) v1.Container {
 		args    = make([]string, 0)
 		envVars = []v1.EnvVar{
 			{
-				Name: "POD_NAME",
+				Name: PodNameEnvVar,
 				ValueFrom: &v1.EnvVarSource{
 					FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.name"},
 				},
@@ -159,26 +211,55 @@ func CreateConfigReloader(name string, options ...ReloaderOption) v1.Container {
 		ports []v1.ContainerPort
 	)
 
-	if configReloader.runOnce {
+	if configReloader.withNodeNameEnv {
+		envVars = append(envVars, v1.EnvVar{
+			Name: NodeNameEnvVar,
+			ValueFrom: &v1.EnvVarSource{
+				FieldRef: &v1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
+			},
+		})
+	}
+
+	if configReloader.initContainer {
 		args = append(args, fmt.Sprintf("--watch-interval=%d", 0))
 	}
 
 	if configReloader.listenLocal {
 		args = append(args, fmt.Sprintf("--listen-address=%s:%d", configReloader.localHost, configReloaderPort))
 	} else {
-		args = append(args, fmt.Sprintf("--listen-address=:%d", configReloaderPort))
+		port := configReloaderPort
+		// Use distinct ports for the init and "regular" containers to avoid
+		// warnings from the k8s client.
+		if configReloader.initContainer {
+			port = initConfigReloaderPort
+		}
+
+		args = append(args, fmt.Sprintf("--listen-address=:%d", port))
 		ports = append(
 			ports,
 			v1.ContainerPort{
 				Name:          "reloader-web",
-				ContainerPort: configReloaderPort,
+				ContainerPort: int32(port),
 				Protocol:      v1.ProtocolTCP,
 			},
 		)
 	}
 
-	if len(configReloader.reloadURL.String()) > 0 {
-		args = append(args, fmt.Sprintf("--reload-url=%s", configReloader.reloadURL.String()))
+	if len(configReloader.webConfigFile) > 0 {
+		args = append(args, fmt.Sprintf("--web-config-file=%s", configReloader.webConfigFile))
+	}
+
+	if configReloader.useSignal {
+		args = append(args, "--reload-method=signal")
+		if len(configReloader.runtimeInfoURL.String()) > 0 {
+			args = append(args, fmt.Sprintf("--runtimeinfo-url=%s", configReloader.runtimeInfoURL.String()))
+		}
+	} else {
+		// Don't set the --reload-method argument in case the operator is
+		// configured with an older version of the config reloader.
+		if len(configReloader.reloadURL.String()) > 0 {
+			args = append(args, fmt.Sprintf("--reload-url=%s", configReloader.reloadURL.String()))
+		}
 	}
 
 	if len(configReloader.configFile) > 0 {
@@ -203,34 +284,14 @@ func CreateConfigReloader(name string, options ...ReloaderOption) v1.Container {
 		args = append(args, fmt.Sprintf("--log-format=%s", configReloader.logFormat))
 	}
 
-	resources := v1.ResourceRequirements{
-		Limits:   v1.ResourceList{},
-		Requests: v1.ResourceList{},
-	}
-
-	if configReloader.config.CPURequest != "0" {
-		resources.Requests[v1.ResourceCPU] = resource.MustParse(configReloader.config.CPURequest)
-	}
-	if configReloader.config.CPULimit != "0" {
-		resources.Limits[v1.ResourceCPU] = resource.MustParse(configReloader.config.CPULimit)
-	}
-	if configReloader.config.MemoryRequest != "0" {
-		resources.Requests[v1.ResourceMemory] = resource.MustParse(configReloader.config.MemoryRequest)
-	}
-	if configReloader.config.MemoryLimit != "0" {
-		resources.Limits[v1.ResourceMemory] = resource.MustParse(configReloader.config.MemoryLimit)
-	}
-
 	if configReloader.shard != nil {
 		envVars = append(envVars, v1.EnvVar{
-			Name:  "SHARD",
+			Name:  ShardEnvVar,
 			Value: strconv.Itoa(int(*configReloader.shard)),
 		})
 	}
 
-	boolFalse := false
-	boolTrue := true
-	return v1.Container{
+	c := v1.Container{
 		Name:                     name,
 		Image:                    configReloader.config.Image,
 		ImagePullPolicy:          configReloader.imagePullPolicy,
@@ -240,13 +301,42 @@ func CreateConfigReloader(name string, options ...ReloaderOption) v1.Container {
 		Args:                     args,
 		Ports:                    ports,
 		VolumeMounts:             configReloader.volumeMounts,
-		Resources:                resources,
+		Resources:                configReloader.config.ResourceRequirements(),
 		SecurityContext: &v1.SecurityContext{
-			AllowPrivilegeEscalation: &boolFalse,
-			ReadOnlyRootFilesystem:   &boolTrue,
+			AllowPrivilegeEscalation: ptr.To(false),
+			ReadOnlyRootFilesystem:   ptr.To(true),
 			Capabilities: &v1.Capabilities{
 				Drop: []v1.Capability{"ALL"},
 			},
 		},
 	}
+
+	if !configReloader.initContainer && configReloader.config.EnableProbes {
+		c = configReloader.addProbes(c)
+	}
+
+	return c
+}
+
+func (cr *ConfigReloader) addProbes(c v1.Container) v1.Container {
+	probePath := path.Clean("/healthz")
+	handler := v1.ProbeHandler{}
+	if cr.listenLocal {
+		probeURL := url.URL{
+			Scheme: "http",
+			Host:   fmt.Sprintf("localhost:%d", configReloaderPort),
+			Path:   probePath,
+		}
+		handler.Exec = ExecAction(probeURL.String())
+	} else {
+		handler.HTTPGet = &v1.HTTPGetAction{
+			Path: probePath,
+			Port: intstr.FromInt(configReloaderPort),
+		}
+	}
+
+	c.LivenessProbe = &v1.Probe{ProbeHandler: handler}
+	c.ReadinessProbe = &v1.Probe{ProbeHandler: handler}
+
+	return c
 }

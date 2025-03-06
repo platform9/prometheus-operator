@@ -20,11 +20,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/utils/ptr"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 )
 
 func testThanosRulerCreateDeleteCluster(t *testing.T) {
@@ -43,6 +47,50 @@ func testThanosRulerCreateDeleteCluster(t *testing.T) {
 	if err := framework.DeleteThanosRulerAndWaitUntilGone(context.Background(), ns, name); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func testThanosRulerWithStatefulsetCreationFailure(t *testing.T) {
+	ctx := context.Background()
+	testCtx := framework.NewTestCtx(t)
+	defer testCtx.Cleanup(t)
+
+	ns := framework.CreateNamespace(ctx, t, testCtx)
+	framework.SetupPrometheusRBAC(ctx, t, testCtx, ns)
+
+	tr := framework.MakeBasicThanosRuler("test", 1, "")
+	// Empty queryEndpoints and queryConfigFile prevent the controller from
+	// creating the statefulset.
+	tr.Spec.QueryEndpoints = []string{}
+
+	_, err := framework.MonClientV1.ThanosRulers(ns).Create(ctx, tr, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	var loopError error
+	err = wait.PollUntilContextTimeout(ctx, time.Second, framework.DefaultTimeout, true, func(ctx context.Context) (bool, error) {
+		current, err := framework.MonClientV1.ThanosRulers(ns).Get(ctx, "test", metav1.GetOptions{})
+		if err != nil {
+			loopError = fmt.Errorf("failed to get object: %w", err)
+			return false, nil
+		}
+
+		if err := framework.AssertCondition(current.Status.Conditions, monitoringv1.Reconciled, monitoringv1.ConditionFalse); err != nil {
+			loopError = err
+			return false, nil
+		}
+
+		if err := framework.AssertCondition(current.Status.Conditions, monitoringv1.Available, monitoringv1.ConditionFalse); err != nil {
+			loopError = err
+			return false, nil
+		}
+
+		return true, nil
+	})
+
+	if err != nil {
+		t.Fatalf("%v: %v", err, loopError)
+	}
+
+	require.NoError(t, framework.DeleteThanosRulerAndWaitUntilGone(ctx, ns, "test"))
 }
 
 func testThanosRulerPrometheusRuleInDifferentNamespace(t *testing.T) {
@@ -109,9 +157,9 @@ func testThanosRulerPrometheusRuleInDifferentNamespace(t *testing.T) {
 	}
 
 	var loopError error
-	err = wait.Poll(time.Second, 5*framework.DefaultTimeout, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(context.Background(), time.Second, 5*framework.DefaultTimeout, false, func(ctx context.Context) (bool, error) {
 		var firing bool
-		firing, loopError = framework.CheckThanosFiringAlert(context.Background(), thanosNamespace, thanosService.Name, testAlert)
+		firing, loopError = framework.CheckThanosFiringAlert(ctx, thanosNamespace, thanosService.Name, testAlert)
 		return !firing, nil
 	})
 
@@ -187,7 +235,7 @@ func testTRPreserveUserAddedMetadata(t *testing.T) {
 
 	// Ensure resource reconciles
 	thanosRuler.Spec.Replicas = proto.Int32(2)
-	_, err = framework.UpdateThanosRulerAndWaitUntilReady(context.Background(), ns, thanosRuler)
+	_, err = framework.PatchThanosRulerAndWaitUntilReady(context.Background(), thanosRuler.Name, ns, thanosRuler.Spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +264,6 @@ func testTRPreserveUserAddedMetadata(t *testing.T) {
 }
 
 func testTRMinReadySeconds(t *testing.T) {
-	runFeatureGatedTests(t)
 	t.Parallel()
 
 	testCtx := framework.NewTestCtx(t)
@@ -245,8 +292,8 @@ func testTRMinReadySeconds(t *testing.T) {
 
 	var updated uint32 = 10
 	thanosRuler.Spec.MinReadySeconds = &updated
-	if _, err = framework.UpdateThanosRulerAndWaitUntilReady(context.Background(), ns, thanosRuler); err != nil {
-		t.Fatal("Updating ThanosRuler failed: ", err)
+	if _, err = framework.PatchThanosRulerAndWaitUntilReady(context.Background(), thanosRuler.Name, ns, thanosRuler.Spec); err != nil {
+		t.Fatal("patching ThanosRuler failed: ", err)
 	}
 
 	trSS, err = kubeClient.AppsV1().StatefulSets(ns).Get(context.Background(), "thanos-ruler-test-thanos", metav1.GetOptions{})
@@ -262,7 +309,7 @@ func testTRMinReadySeconds(t *testing.T) {
 // Tests Thanos ruler -> Alertmanger path
 // This is done by creating a firing rule that will be picked up by
 // Thanos Ruler which will send it to Alertmanager, finally we will
-// use the Alertmanager API to validate that the alert is there
+// use the Alertmanager API to validate that the alert is there.
 func testTRAlertmanagerConfig(t *testing.T) {
 	const (
 		name       = "test"
@@ -279,19 +326,19 @@ func testTRAlertmanagerConfig(t *testing.T) {
 
 	// Create Alertmanager resource and service
 	alertmanager, err := framework.CreateAlertmanagerAndWaitUntilReady(context.Background(), framework.MakeBasicAlertmanager(ns, name, 1))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	amSVC := framework.MakeAlertmanagerService(alertmanager.Name, group, v1.ServiceTypeClusterIP)
 	_, err = framework.CreateOrUpdateServiceAndWaitUntilReady(context.Background(), ns, amSVC)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Create a Prometheus resource because Thanos ruler needs a query API.
 	prometheus, err := framework.CreatePrometheusAndWaitUntilReady(context.Background(), ns, framework.MakeBasicPrometheus(ns, name, name, 1))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	svc := framework.MakePrometheusService(prometheus.Name, name, v1.ServiceTypeClusterIP)
 	_, err = framework.CreateOrUpdateServiceAndWaitUntilReady(context.Background(), ns, svc)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Create Secret with Alermanager config,
 	trAmConfigSecret := &v1.Secret{
@@ -309,7 +356,7 @@ alertmanagers:
 		},
 	}
 	_, err = framework.KubeClient.CoreV1().Secrets(ns).Create(context.Background(), trAmConfigSecret, metav1.CreateOptions{})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Create Thanos ruler resource and service
 	thanos := framework.MakeBasicThanosRuler(name, 1, fmt.Sprintf("http://%s:%d/", svc.Name, svc.Spec.Ports[0].Port))
@@ -322,23 +369,23 @@ alertmanagers:
 	}
 
 	_, err = framework.CreateThanosRulerAndWaitUntilReady(context.Background(), ns, thanos)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	_, err = framework.CreateOrUpdateServiceAndWaitUntilReady(context.Background(), ns, framework.MakeThanosRulerService(thanos.Name, group, v1.ServiceTypeClusterIP))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Create firing rule
 	_, err = framework.MakeAndCreateFiringRule(context.Background(), ns, "rule1", testAlert)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	err = framework.WaitForAlertmanagerFiringAlert(context.Background(), ns, amSVC.Name, testAlert)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 // Tests Thanos ruler query Config
 // This is done by creating a firing rule that will be picked up by
 // Thanos Ruler which will only fire the rule if it's able to query prometheus
-// it has to pull configuration from queryConfig file
+// it has to pull configuration from queryConfig file.
 func testTRQueryConfig(t *testing.T) {
 	const (
 		name       = "test"
@@ -355,11 +402,11 @@ func testTRQueryConfig(t *testing.T) {
 
 	// Create a Prometheus resource because Thanos ruler needs a query API.
 	prometheus, err := framework.CreatePrometheusAndWaitUntilReady(context.Background(), ns, framework.MakeBasicPrometheus(ns, name, name, 1))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	promSVC := framework.MakePrometheusService(prometheus.Name, name, v1.ServiceTypeClusterIP)
 	_, err = framework.CreateOrUpdateServiceAndWaitUntilReady(context.Background(), ns, promSVC)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Create Secret with query config,
 	trQueryConfSecret := &v1.Secret{
@@ -375,7 +422,7 @@ func testTRQueryConfig(t *testing.T) {
 		},
 	}
 	_, err = framework.KubeClient.CoreV1().Secrets(ns).Create(context.Background(), trQueryConfSecret, metav1.CreateOptions{})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Create Thanos ruler resource and service
 	// setting queryEndpoint to "" as it will be ignored because we set QueryConfig
@@ -389,17 +436,126 @@ func testTRQueryConfig(t *testing.T) {
 	}
 
 	_, err = framework.CreateThanosRulerAndWaitUntilReady(context.Background(), ns, thanos)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	svc := framework.MakeThanosRulerService(thanos.Name, group, v1.ServiceTypeClusterIP)
 	_, err = framework.CreateOrUpdateServiceAndWaitUntilReady(context.Background(), ns, svc)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Create firing rule
 	_, err = framework.MakeAndCreateFiringRule(context.Background(), ns, "rule1", testAlert)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	if err := framework.WaitForThanosFiringAlert(context.Background(), ns, svc.Name, testAlert); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func testTRCheckStorageClass(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	testCtx := framework.NewTestCtx(t)
+	defer testCtx.Cleanup(t)
+
+	ns := framework.CreateNamespace(ctx, t, testCtx)
+	framework.SetupPrometheusRBAC(ctx, t, testCtx, ns)
+
+	tr := framework.MakeBasicThanosRuler("test", 1, "http://test.example.com")
+
+	tr, err := framework.CreateThanosRulerAndWaitUntilReady(ctx, ns, tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Invalid storageclass e2e test
+
+	_, err = framework.PatchThanosRuler(
+		context.Background(),
+		tr.Name,
+		ns,
+		monitoringv1.ThanosRulerSpec{
+			Storage: &monitoringv1.StorageSpec{
+				VolumeClaimTemplate: monitoringv1.EmbeddedPersistentVolumeClaim{
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: ptr.To("unknown-storage-class"),
+						Resources: v1.VolumeResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceStorage: resource.MustParse("200Mi"),
+							},
+						},
+					},
+				},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var loopError error
+	err = wait.PollUntilContextTimeout(ctx, 5*time.Second, framework.DefaultTimeout, true, func(ctx context.Context) (bool, error) {
+		current, err := framework.MonClientV1.ThanosRulers(ns).Get(ctx, tr.Name, metav1.GetOptions{})
+		if err != nil {
+			loopError = fmt.Errorf("failed to get object: %w", err)
+			return false, nil
+		}
+
+		if err := framework.AssertCondition(current.Status.Conditions, monitoringv1.Reconciled, monitoringv1.ConditionFalse); err == nil {
+			return true, nil
+		}
+
+		return false, nil
+	})
+
+	if err != nil {
+		t.Fatalf("%v: %v", err, loopError)
+	}
+}
+
+func testThanosRulerServiceName(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	testCtx := framework.NewTestCtx(t)
+	defer testCtx.Cleanup(t)
+	ns := framework.CreateNamespace(ctx, t, testCtx)
+	name := "test-servicename"
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-service", name),
+			Namespace: ns,
+		},
+		Spec: v1.ServiceSpec{
+			Type: v1.ServiceTypeLoadBalancer,
+			Ports: []v1.ServicePort{
+				{
+					Name: "web",
+					Port: 9090,
+				},
+			},
+			Selector: map[string]string{
+				"app.kubernetes.io/name":       "thanos-ruler",
+				"app.kubernetes.io/managed-by": "prometheus-operator",
+				"app.kubernetes.io/instance":   name,
+				"thanos-ruler":                 name,
+			},
+		},
+	}
+
+	_, err := framework.KubeClient.CoreV1().Services(ns).Create(ctx, svc, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	framework.SetupPrometheusRBAC(ctx, t, testCtx, ns)
+
+	tr := framework.MakeBasicThanosRuler(name, 1, "http://test.example.com")
+	tr.Spec.ServiceName = &svc.Name
+
+	_, err = framework.CreateThanosRulerAndWaitUntilReady(ctx, ns, tr)
+	require.NoError(t, err)
+
+	// Ensure that the default governing service was not created by the operator.
+	svcList, err := framework.KubeClient.CoreV1().Services(ns).List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, svcList.Items, 1)
+	require.Equal(t, svcList.Items[0].Name, svc.Name)
 }

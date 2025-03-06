@@ -15,17 +15,19 @@
 package namespacelabeler
 
 import (
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
+	"fmt"
 
-	"github.com/pkg/errors"
 	"github.com/prometheus-community/prom-label-proxy/injectproxy"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 )
 
-// Labeler enables to enforce adding namespace labels to PrometheusRules and to metrics used in them
+// Labeler enables to enforce adding namespace labels to PrometheusRules and to metrics used in them.
 type Labeler struct {
 	enforcedNsLabel                  string
 	prometheusRuleLabeler            bool
@@ -40,7 +42,7 @@ type namespaceGroupKind struct {
 // New - creates new Labeler
 // enforcedNsLabel - label name to be enforced for namespace
 // excludeConfig - list of ObjectReference to be excluded while enforcing adding namespace label
-// prometheusRuleLabeler - whether this should apply for Prometheus or Thanos rules
+// prometheusRuleLabeler - whether this should apply for Prometheus or Thanos rules.
 func New(enforcedNsLabel string, excludeConfig []monitoringv1.ObjectReference, prometheusRuleLabeler bool) *Labeler {
 
 	if enforcedNsLabel == "" {
@@ -74,7 +76,7 @@ func (l *Labeler) GetEnforcedNamespaceLabel() string {
 }
 
 // IsExcluded returns true if the specified object is excluded from namespace enforcement,
-// false otherwise
+// false otherwise.
 func (l *Labeler) IsExcluded(prometheusTypeMeta metav1.TypeMeta, prometheusObjectMeta metav1.ObjectMeta) bool {
 	if l.enforcedNsLabel == "" {
 		return true
@@ -95,7 +97,7 @@ func (l *Labeler) IsExcluded(prometheusTypeMeta metav1.TypeMeta, prometheusObjec
 }
 
 // EnforceNamespaceLabel - adds(or modifies) namespace label to promRule labels with specified namespace
-// and also adds namespace label to all the metrics used in promRule
+// and also adds namespace label to all the metrics used in promRule.
 func (l *Labeler) EnforceNamespaceLabel(rule *monitoringv1.PrometheusRule) error {
 
 	if l.enforcedNsLabel == "" || l.IsExcluded(rule.TypeMeta, rule.ObjectMeta) {
@@ -115,16 +117,16 @@ func (l *Labeler) EnforceNamespaceLabel(rule *monitoringv1.PrometheusRule) error
 			expr := r.Expr.String()
 			parsedExpr, err := parser.ParseExpr(expr)
 			if err != nil {
-				return errors.Wrap(err, "failed to parse promql expression")
+				return fmt.Errorf("failed to parse promql expression: %w", err)
 			}
-			enforcer := injectproxy.NewEnforcer(false, &labels.Matcher{
+			enforcer := injectproxy.NewPromQLEnforcer(false, &labels.Matcher{
 				Name:  l.enforcedNsLabel,
 				Type:  labels.MatchEqual,
 				Value: rule.Namespace,
 			})
 			err = enforcer.EnforceNode(parsedExpr)
 			if err != nil {
-				return errors.Wrap(err, "failed to inject labels to expression")
+				return fmt.Errorf("failed to inject labels to expression: %w", err)
 			}
 
 			rule.Spec.Groups[gi].Rules[ri].Expr = intstr.FromString(parsedExpr.String())
@@ -133,8 +135,8 @@ func (l *Labeler) EnforceNamespaceLabel(rule *monitoringv1.PrometheusRule) error
 	return nil
 }
 
-// GetRelabelingConfigs - append the namespace enforcement relabeling rule
-func (l *Labeler) GetRelabelingConfigs(monitorTypeMeta metav1.TypeMeta, monitorObjectMeta metav1.ObjectMeta, rc []*monitoringv1.RelabelConfig) []*monitoringv1.RelabelConfig {
+// GetRelabelingConfigs - append the namespace enforcement relabeling rule.
+func (l *Labeler) GetRelabelingConfigs(monitorTypeMeta metav1.TypeMeta, monitorObjectMeta metav1.ObjectMeta, rc []monitoringv1.RelabelConfig) []monitoringv1.RelabelConfig {
 
 	if l.IsExcluded(monitorTypeMeta, monitorObjectMeta) {
 		return rc
@@ -143,9 +145,9 @@ func (l *Labeler) GetRelabelingConfigs(monitorTypeMeta metav1.TypeMeta, monitorO
 	// Because of security risks, whenever enforcedNamespaceLabel is set, we want to append it to the
 	// relabel configurations as the last relabeling, to ensure it overrides any other relabelings.
 	return append(rc,
-		&monitoringv1.RelabelConfig{
+		monitoringv1.RelabelConfig{
 			TargetLabel: l.GetEnforcedNamespaceLabel(),
-			Replacement: monitorObjectMeta.GetNamespace(),
+			Replacement: ptr.To(monitorObjectMeta.GetNamespace()),
 		},
 	)
 }

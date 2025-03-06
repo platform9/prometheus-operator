@@ -15,25 +15,26 @@
 package prometheus
 
 import (
-	"reflect"
+	"context"
 	"testing"
 
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 
-	"github.com/kylelemons/godebug/pretty"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
+	prompkg "github.com/prometheus-operator/prometheus-operator/pkg/prometheus"
 )
 
 func TestListOptions(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		o := ListOptions("test")
-		if o.LabelSelector != "app.kubernetes.io/name=prometheus,prometheus=test" && o.LabelSelector != "prometheus=test,app.kubernetes.io/name=prometheus" {
-			t.Fatalf("LabelSelector not computed correctly\n\nExpected: \"app.kubernetes.io/name=prometheus,prometheus=test\"\n\nGot:      %#+v", o.LabelSelector)
-		}
+		require.True(t, (o.LabelSelector == "app.kubernetes.io/name=prometheus,prometheus=test" || o.LabelSelector == "prometheus=test,app.kubernetes.io/name=prometheus"), "LabelSelector not computed correctly\n\nExpected: \"app.kubernetes.io/name=prometheus,prometheus=test\"\n\nGot:      %#+v", o.LabelSelector)
 	}
 }
 
@@ -206,120 +207,60 @@ func TestCreateStatefulSetInputHash(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := operator.Config{}
+			c := prompkg.Config{}
 
-			p1Hash, err := createSSetInputHash(tc.a, c, []string{}, nil, appsv1.StatefulSetSpec{})
-			if err != nil {
-				t.Fatal(err)
-			}
+			p1Hash, err := createSSetInputHash(tc.a, c, []string{}, &operator.ShardedSecret{}, appsv1.StatefulSetSpec{})
+			require.NoError(t, err)
 
-			p2Hash, err := createSSetInputHash(tc.b, c, []string{}, nil, appsv1.StatefulSetSpec{})
-			if err != nil {
-				t.Fatal(err)
-			}
+			p2Hash, err := createSSetInputHash(tc.b, c, []string{}, &operator.ShardedSecret{}, appsv1.StatefulSetSpec{})
+			require.NoError(t, err)
 
 			if !tc.equal {
-				if p1Hash == p2Hash {
-					t.Fatal("expected two different Prometheus CRDs to produce different hashes but got equal hash")
-				}
+				require.NotEqual(t, p1Hash, p2Hash, "expected two different Prometheus CRDs to produce different hashes but got equal hash")
 				return
 			}
 
-			if p1Hash != p2Hash {
-				t.Fatal("expected two Prometheus CRDs to produce the same hash but got different hash")
-			}
+			require.Equal(t, p1Hash, p2Hash, "expected two Prometheus CRDs to produce the same hash but got different hash")
 
-			p2Hash, err = createSSetInputHash(tc.a, c, []string{}, nil, appsv1.StatefulSetSpec{Replicas: func(i int32) *int32 { return &i }(2)})
-			if err != nil {
-				t.Fatal(err)
-			}
+			p2Hash, err = createSSetInputHash(tc.a, c, []string{}, &operator.ShardedSecret{}, appsv1.StatefulSetSpec{Replicas: ptr.To(int32(2))})
+			require.NoError(t, err)
 
-			if p1Hash == p2Hash {
-				t.Fatal("expected same Prometheus CRDs with different statefulset specs to produce different hashes but got equal hash")
-			}
+			require.NotEqual(t, p1Hash, p2Hash, "expected same Prometheus CRDs with different statefulset specs to produce different hashes but got equal hash")
 		})
 	}
 }
 
-func TestGetNodeAddresses(t *testing.T) {
-	cases := []struct {
-		name              string
-		nodes             *v1.NodeList
-		expectedAddresses []string
-		expectedErrors    int
+func TestCreateThanosConfigSecret(t *testing.T) {
+	version := "v0.24.0"
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		spec monitoringv1.PrometheusSpec
 	}{
 		{
-			name: "simple",
-			nodes: &v1.NodeList{
-				Items: []v1.Node{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node-0",
-						},
-						Status: v1.NodeStatus{
-							Addresses: []v1.NodeAddress{
-								{
-									Address: "10.0.0.1",
-									Type:    v1.NodeInternalIP,
-								},
-							},
-						},
-					},
+			name: "prometheus with thanos sidecar",
+			spec: monitoringv1.PrometheusSpec{
+				Thanos: &monitoringv1.ThanosSpec{
+					Version: &version,
 				},
 			},
-			expectedAddresses: []string{"10.0.0.1"},
-			expectedErrors:    0,
 		},
-		{
-			// Replicates #1815
-			name: "missing ip on one node",
-			nodes: &v1.NodeList{
-				Items: []v1.Node{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node-0",
-						},
-						Status: v1.NodeStatus{
-							Addresses: []v1.NodeAddress{
-								{
-									Address: "node-0",
-									Type:    v1.NodeHostName,
-								},
-							},
-						},
-					},
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node-1",
-						},
-						Status: v1.NodeStatus{
-							Addresses: []v1.NodeAddress{
-								{
-									Address: "10.0.0.1",
-									Type:    v1.NodeInternalIP,
-								},
-							},
-						},
-					},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &monitoringv1.Prometheus{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-create-thanos-config-secret",
+					Namespace: "test",
 				},
-			},
-			expectedAddresses: []string{"10.0.0.1"},
-			expectedErrors:    1,
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			addrs, errs := getNodeAddresses(c.nodes)
-			if len(errs) != c.expectedErrors {
-				t.Errorf("Expected %d errors, got %d. Errors: %v", c.expectedErrors, len(errs), errs)
+				Spec: tc.spec,
 			}
-			ips := make([]string, 0)
-			for _, addr := range addrs {
-				ips = append(ips, addr.IP)
-			}
-			if !reflect.DeepEqual(ips, c.expectedAddresses) {
-				t.Error(pretty.Compare(ips, c.expectedAddresses))
-			}
+			o := Operator{kclient: fake.NewClientset()}
+			err := o.createOrUpdateThanosConfigSecret(ctx, p)
+			require.NoError(t, err)
+
+			get, err := o.kclient.CoreV1().Secrets("test").Get(ctx, thanosPrometheusHTTPClientConfigSecretName(p), metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, "tls_config:\n  insecure_skip_verify: true\n", string(get.Data[thanosPrometheusHTTPClientConfigFileName]))
 		})
 	}
 }
