@@ -17,38 +17,39 @@
 package v1
 
 import (
-	v1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	corev1 "k8s.io/api/core/v1"
 	intstr "k8s.io/apimachinery/pkg/util/intstr"
 )
 
-// EndpointApplyConfiguration represents an declarative configuration of the Endpoint type for use
+// EndpointApplyConfiguration represents a declarative configuration of the Endpoint type for use
 // with apply.
 type EndpointApplyConfiguration struct {
-	Port                 *string                              `json:"port,omitempty"`
-	TargetPort           *intstr.IntOrString                  `json:"targetPort,omitempty"`
-	Path                 *string                              `json:"path,omitempty"`
-	Scheme               *string                              `json:"scheme,omitempty"`
-	Params               map[string][]string                  `json:"params,omitempty"`
-	Interval             *v1.Duration                         `json:"interval,omitempty"`
-	ScrapeTimeout        *v1.Duration                         `json:"scrapeTimeout,omitempty"`
-	TLSConfig            *TLSConfigApplyConfiguration         `json:"tlsConfig,omitempty"`
-	BearerTokenFile      *string                              `json:"bearerTokenFile,omitempty"`
-	BearerTokenSecret    *corev1.SecretKeySelector            `json:"bearerTokenSecret,omitempty"`
-	Authorization        *SafeAuthorizationApplyConfiguration `json:"authorization,omitempty"`
-	HonorLabels          *bool                                `json:"honorLabels,omitempty"`
-	HonorTimestamps      *bool                                `json:"honorTimestamps,omitempty"`
-	BasicAuth            *BasicAuthApplyConfiguration         `json:"basicAuth,omitempty"`
-	OAuth2               *OAuth2ApplyConfiguration            `json:"oauth2,omitempty"`
-	MetricRelabelConfigs []*v1.RelabelConfig                  `json:"metricRelabelings,omitempty"`
-	RelabelConfigs       []*v1.RelabelConfig                  `json:"relabelings,omitempty"`
-	ProxyURL             *string                              `json:"proxyUrl,omitempty"`
-	FollowRedirects      *bool                                `json:"followRedirects,omitempty"`
-	EnableHttp2          *bool                                `json:"enableHttp2,omitempty"`
-	FilterRunning        *bool                                `json:"filterRunning,omitempty"`
+	Port                     *string                              `json:"port,omitempty"`
+	TargetPort               *intstr.IntOrString                  `json:"targetPort,omitempty"`
+	Path                     *string                              `json:"path,omitempty"`
+	Scheme                   *string                              `json:"scheme,omitempty"`
+	Params                   map[string][]string                  `json:"params,omitempty"`
+	Interval                 *monitoringv1.Duration               `json:"interval,omitempty"`
+	ScrapeTimeout            *monitoringv1.Duration               `json:"scrapeTimeout,omitempty"`
+	TLSConfig                *TLSConfigApplyConfiguration         `json:"tlsConfig,omitempty"`
+	BearerTokenFile          *string                              `json:"bearerTokenFile,omitempty"`
+	BearerTokenSecret        *corev1.SecretKeySelector            `json:"bearerTokenSecret,omitempty"`
+	Authorization            *SafeAuthorizationApplyConfiguration `json:"authorization,omitempty"`
+	HonorLabels              *bool                                `json:"honorLabels,omitempty"`
+	HonorTimestamps          *bool                                `json:"honorTimestamps,omitempty"`
+	TrackTimestampsStaleness *bool                                `json:"trackTimestampsStaleness,omitempty"`
+	BasicAuth                *BasicAuthApplyConfiguration         `json:"basicAuth,omitempty"`
+	OAuth2                   *OAuth2ApplyConfiguration            `json:"oauth2,omitempty"`
+	MetricRelabelConfigs     []RelabelConfigApplyConfiguration    `json:"metricRelabelings,omitempty"`
+	RelabelConfigs           []RelabelConfigApplyConfiguration    `json:"relabelings,omitempty"`
+	ProxyURL                 *string                              `json:"proxyUrl,omitempty"`
+	FollowRedirects          *bool                                `json:"followRedirects,omitempty"`
+	EnableHttp2              *bool                                `json:"enableHttp2,omitempty"`
+	FilterRunning            *bool                                `json:"filterRunning,omitempty"`
 }
 
-// EndpointApplyConfiguration constructs an declarative configuration of the Endpoint type for use with
+// EndpointApplyConfiguration constructs a declarative configuration of the Endpoint type for use with
 // apply.
 func Endpoint() *EndpointApplyConfiguration {
 	return &EndpointApplyConfiguration{}
@@ -103,7 +104,7 @@ func (b *EndpointApplyConfiguration) WithParams(entries map[string][]string) *En
 // WithInterval sets the Interval field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Interval field is set to the value of the last call.
-func (b *EndpointApplyConfiguration) WithInterval(value v1.Duration) *EndpointApplyConfiguration {
+func (b *EndpointApplyConfiguration) WithInterval(value monitoringv1.Duration) *EndpointApplyConfiguration {
 	b.Interval = &value
 	return b
 }
@@ -111,7 +112,7 @@ func (b *EndpointApplyConfiguration) WithInterval(value v1.Duration) *EndpointAp
 // WithScrapeTimeout sets the ScrapeTimeout field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the ScrapeTimeout field is set to the value of the last call.
-func (b *EndpointApplyConfiguration) WithScrapeTimeout(value v1.Duration) *EndpointApplyConfiguration {
+func (b *EndpointApplyConfiguration) WithScrapeTimeout(value monitoringv1.Duration) *EndpointApplyConfiguration {
 	b.ScrapeTimeout = &value
 	return b
 }
@@ -164,6 +165,14 @@ func (b *EndpointApplyConfiguration) WithHonorTimestamps(value bool) *EndpointAp
 	return b
 }
 
+// WithTrackTimestampsStaleness sets the TrackTimestampsStaleness field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the TrackTimestampsStaleness field is set to the value of the last call.
+func (b *EndpointApplyConfiguration) WithTrackTimestampsStaleness(value bool) *EndpointApplyConfiguration {
+	b.TrackTimestampsStaleness = &value
+	return b
+}
+
 // WithBasicAuth sets the BasicAuth field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the BasicAuth field is set to the value of the last call.
@@ -183,7 +192,7 @@ func (b *EndpointApplyConfiguration) WithOAuth2(value *OAuth2ApplyConfiguration)
 // WithMetricRelabelConfigs adds the given value to the MetricRelabelConfigs field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the MetricRelabelConfigs field.
-func (b *EndpointApplyConfiguration) WithMetricRelabelConfigs(values ...**v1.RelabelConfig) *EndpointApplyConfiguration {
+func (b *EndpointApplyConfiguration) WithMetricRelabelConfigs(values ...*RelabelConfigApplyConfiguration) *EndpointApplyConfiguration {
 	for i := range values {
 		if values[i] == nil {
 			panic("nil value passed to WithMetricRelabelConfigs")
@@ -196,7 +205,7 @@ func (b *EndpointApplyConfiguration) WithMetricRelabelConfigs(values ...**v1.Rel
 // WithRelabelConfigs adds the given value to the RelabelConfigs field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the RelabelConfigs field.
-func (b *EndpointApplyConfiguration) WithRelabelConfigs(values ...**v1.RelabelConfig) *EndpointApplyConfiguration {
+func (b *EndpointApplyConfiguration) WithRelabelConfigs(values ...*RelabelConfigApplyConfiguration) *EndpointApplyConfiguration {
 	for i := range values {
 		if values[i] == nil {
 			panic("nil value passed to WithRelabelConfigs")

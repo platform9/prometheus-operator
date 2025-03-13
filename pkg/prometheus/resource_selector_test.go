@@ -15,12 +15,35 @@
 package prometheus
 
 import (
-	"fmt"
+	"context"
+	"log/slog"
+	"os"
 	"testing"
 
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	monitoringv1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
+	"github.com/prometheus-operator/prometheus-operator/pkg/assets"
+	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
 )
+
+var (
+	certsDir = "../../test/e2e/tls_certs/"
+)
+
+func newLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
 
 func TestValidateRelabelConfig(t *testing.T) {
 	defaultRegexp, err := relabel.DefaultRelabelConfig.Regex.MarshalYAML()
@@ -115,7 +138,7 @@ func TestValidateRelabelConfig(t *testing.T) {
 			scenario: "replacement set for uppercase action",
 			relabelConfig: monitoringv1.RelabelConfig{
 				Action:      "uppercase",
-				Replacement: "some-replace-value",
+				Replacement: ptr.To("some-replace-value"),
 			},
 			prometheus:  defaultPrometheusSpec,
 			expectedErr: true,
@@ -138,7 +161,7 @@ func TestValidateRelabelConfig(t *testing.T) {
 			relabelConfig: monitoringv1.RelabelConfig{
 				Action:      "labelmap",
 				Regex:       "__meta_kubernetes_service_label_(.+)",
-				Replacement: "some-name-value",
+				Replacement: ptr.To("some-name-value"),
 			},
 			prometheus:  defaultPrometheusSpec,
 			expectedErr: true,
@@ -158,7 +181,7 @@ func TestValidateRelabelConfig(t *testing.T) {
 			relabelConfig: monitoringv1.RelabelConfig{
 				Action:      "labelmap",
 				Regex:       "__meta_kubernetes_service_label_(.+)",
-				Replacement: "${2}",
+				Replacement: ptr.To("${2}"),
 			},
 			prometheus: defaultPrometheusSpec,
 		},
@@ -190,15 +213,26 @@ func TestValidateRelabelConfig(t *testing.T) {
 			},
 			prometheus: defaultPrometheusSpec,
 		},
+		// Test valid relabel config with empty replacement
+		{
+			scenario: "valid replace config with empty replacement",
+			relabelConfig: monitoringv1.RelabelConfig{
+				Action:      "replace",
+				TargetLabel: "dummyTarget",
+				Regex:       "replica",
+				Replacement: ptr.To(""),
+			},
+			prometheus: defaultPrometheusSpec,
+		},
 		{
 			scenario: "valid labeldrop config with default values",
 			relabelConfig: monitoringv1.RelabelConfig{
 				SourceLabels: defaultSourceLabels,
-				Separator:    relabel.DefaultRelabelConfig.Separator,
+				Separator:    ptr.To(relabel.DefaultRelabelConfig.Separator),
 				TargetLabel:  relabel.DefaultRelabelConfig.TargetLabel,
 				Regex:        defaultRegex,
 				Modulus:      relabel.DefaultRelabelConfig.Modulus,
-				Replacement:  relabel.DefaultRelabelConfig.Replacement,
+				Replacement:  &relabel.DefaultRelabelConfig.Replacement,
 				Action:       "labeldrop",
 			},
 			prometheus: defaultPrometheusSpec,
@@ -221,7 +255,7 @@ func TestValidateRelabelConfig(t *testing.T) {
 				SourceLabels: []monitoringv1.LabelName{"__address__"},
 				Action:       "replace",
 				Regex:        "([^:]+)(?::\\d+)?",
-				Replacement:  "$1:80",
+				Replacement:  ptr.To("$1:80"),
 				TargetLabel:  "__address__",
 			},
 			prometheus: defaultPrometheusSpec,
@@ -352,9 +386,9 @@ func TestValidateRelabelConfig(t *testing.T) {
 			relabelConfig: monitoringv1.RelabelConfig{
 				SourceLabels: []monitoringv1.LabelName{"__tmp_port"},
 				TargetLabel:  "__port1",
-				Separator:    "^",
+				Separator:    ptr.To("^"),
 				Regex:        "validregex",
-				Replacement:  "replacevalue",
+				Replacement:  ptr.To("replacevalue"),
 				Action:       "keepequal",
 			},
 			prometheus: monitoringv1.Prometheus{
@@ -372,10 +406,10 @@ func TestValidateRelabelConfig(t *testing.T) {
 			relabelConfig: monitoringv1.RelabelConfig{
 				SourceLabels: []monitoringv1.LabelName{"__tmp_port"},
 				TargetLabel:  "__port1",
-				Separator:    relabel.DefaultRelabelConfig.Separator,
+				Separator:    ptr.To(relabel.DefaultRelabelConfig.Separator),
 				Regex:        relabel.DefaultRelabelConfig.Regex.String(),
 				Modulus:      relabel.DefaultRelabelConfig.Modulus,
-				Replacement:  relabel.DefaultRelabelConfig.Replacement,
+				Replacement:  &relabel.DefaultRelabelConfig.Replacement,
 				Action:       "keepequal",
 			},
 			prometheus: monitoringv1.Prometheus{
@@ -387,89 +421,275 @@ func TestValidateRelabelConfig(t *testing.T) {
 			},
 		},
 	} {
-		t.Run(fmt.Sprintf("case %s", tc.scenario), func(t *testing.T) {
-			err := validateRelabelConfig(&tc.prometheus, tc.relabelConfig)
-			if err != nil && !tc.expectedErr {
-				t.Fatalf("expected no error, got: %v", err)
+		t.Run(tc.scenario, func(t *testing.T) {
+			lcv, err := NewLabelConfigValidator(&tc.prometheus)
+			require.NoError(t, err)
+
+			err = lcv.validate(tc.relabelConfig)
+			if tc.expectedErr {
+				require.Error(t, err)
+				return
 			}
-			if err == nil && tc.expectedErr {
-				t.Fatalf("expected an error, got nil")
-			}
+			require.NoError(t, err)
 		})
 	}
 }
 
-func TestValidateProberUrl(t *testing.T) {
+func TestSelectProbes(t *testing.T) {
 	for _, tc := range []struct {
 		scenario    string
-		proberSpec  monitoringv1.ProberSpec
-		expectedErr bool
+		updateSpec  func(*monitoringv1.ProbeSpec)
+		selected    bool
+		scrapeClass *string
 	}{
 		{
 			scenario: "url starting with http",
-			proberSpec: monitoringv1.ProberSpec{
-				URL: "http://blackbox-exporter.example.com",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.ProberSpec.URL = "http://blackbox-exporter.example.com"
 			},
-			expectedErr: true,
+			selected: false,
 		},
 		{
 			scenario: "url starting with https",
-			proberSpec: monitoringv1.ProberSpec{
-				URL: "https://blackbox-exporter.example.com",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.ProberSpec.URL = "https://blackbox-exporter.example.com"
 			},
-			expectedErr: true,
+			selected: false,
 		},
 		{
 			scenario: "url starting with ftp",
-			proberSpec: monitoringv1.ProberSpec{
-				URL: "ftp://fileserver.com",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.ProberSpec.URL = "ftp://fileserver.com"
 			},
-			expectedErr: true,
+			selected: false,
 		},
 		{
 			scenario: "ip address as prober url",
-			proberSpec: monitoringv1.ProberSpec{
-				URL: "192.168.178.3",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.ProberSpec.URL = "192.168.178.3"
 			},
+			selected: true,
 		},
 		{
 			scenario: "ip address:port as prober url",
-			proberSpec: monitoringv1.ProberSpec{
-				URL: "192.168.178.3:9090",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.ProberSpec.URL = "192.168.178.3:9090"
 			},
+			selected: true,
 		},
 		{
 			scenario: "dnsname as prober url",
-			proberSpec: monitoringv1.ProberSpec{
-				URL: "blackbox-exporter.example.com",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.ProberSpec.URL = "blackbox-exporter.example.com"
 			},
+			selected: true,
 		},
 		{
 			scenario: "dnsname:port as prober url",
-			proberSpec: monitoringv1.ProberSpec{
-				URL: "blackbox-exporter.example.com:8080",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.ProberSpec.URL = "blackbox-exporter.example.com:8080"
 			},
+			selected: true,
 		},
 		{
 			scenario: "hostname as prober url",
-			proberSpec: monitoringv1.ProberSpec{
-				URL: "localhost",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.ProberSpec.URL = "localhost"
 			},
+			selected: true,
 		},
 		{
 			scenario: "hostname starting with a digit as prober url",
-			proberSpec: monitoringv1.ProberSpec{
-				URL: "12-exporter.example.com",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.ProberSpec.URL = "12-exporter.example.com"
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid proxyurl",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.ProberSpec.ProxyURL = "http://xxx-${dev}.svc.cluster.local:80"
+			},
+			selected: false,
+		},
+		{
+			scenario: "valid proxyurl",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.ProberSpec.ProxyURL = "123-proxy.example.com"
+			},
+			selected: true,
+		},
+		{
+			scenario: "valid metric relabeling config",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.MetricRelabelConfigs = []monitoringv1.RelabelConfig{
+					{
+						Action:       "Replace",
+						TargetLabel:  "valid",
+						SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid metric relabeling config",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.MetricRelabelConfigs = []monitoringv1.RelabelConfig{
+					{
+						Action:       "Replace",
+						TargetLabel:  " invalid label name",
+						SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+					},
+				}
 			},
 		},
+		{
+			scenario: "valid static relabeling config",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.Targets.StaticConfig.RelabelConfigs = []monitoringv1.RelabelConfig{
+					{
+						Action:       "Replace",
+						TargetLabel:  "valid",
+						SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid static relabeling config",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.Targets.StaticConfig.RelabelConfigs = []monitoringv1.RelabelConfig{
+					{
+						Action:       "Replace",
+						TargetLabel:  " invalid label name",
+						SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "valid ingress relabeling config",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.Targets.StaticConfig = nil
+				ps.Targets.Ingress = &monitoringv1.ProbeTargetIngress{
+					RelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  "valid",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid ingress relabeling config",
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.Targets.Ingress = &monitoringv1.ProbeTargetIngress{
+					RelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  " invalid label name",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario:    "inexistent scrape class",
+			scrapeClass: ptr.To("inexistent"),
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.Targets.StaticConfig = nil
+				ps.Targets.Ingress = &monitoringv1.ProbeTargetIngress{
+					RelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  "valid",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario:    "existent scrape class",
+			scrapeClass: ptr.To("existent"),
+			updateSpec: func(ps *monitoringv1.ProbeSpec) {
+				ps.Targets.StaticConfig = nil
+				ps.Targets.Ingress = &monitoringv1.ProbeTargetIngress{
+					RelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  "valid",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
 	} {
-		t.Run(fmt.Sprintf("case %s %s", tc.scenario, tc.proberSpec.URL), func(t *testing.T) {
-			err := validateProberURL(tc.proberSpec.URL)
-			if err != nil && !tc.expectedErr {
-				t.Fatalf("expected no error, got: %v", err)
+		t.Run(tc.scenario, func(t *testing.T) {
+			cs := fake.NewSimpleClientset()
+
+			rs, err := NewResourceSelector(
+				newLogger(),
+				&monitoringv1.Prometheus{
+					Spec: monitoringv1.PrometheusSpec{
+						CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+							ScrapeClasses: []monitoringv1.ScrapeClass{
+								{
+									Name: "existent",
+								},
+							},
+						},
+					},
+				},
+				assets.NewStoreBuilder(cs.CoreV1(), cs.CoreV1()),
+				nil,
+				operator.NewMetrics(prometheus.NewPedanticRegistry()),
+				record.NewFakeRecorder(1),
+			)
+			require.NoError(t, err)
+
+			probe := &monitoringv1.Probe{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test",
+					Namespace: "test",
+				},
+				Spec: monitoringv1.ProbeSpec{
+					ProberSpec: monitoringv1.ProberSpec{
+						URL: "example.com:80",
+					},
+					Targets: monitoringv1.ProbeTargets{
+						StaticConfig: &monitoringv1.ProbeTargetStaticConfig{},
+					},
+				},
 			}
-			if err == nil && tc.expectedErr {
-				t.Fatalf("expected an error, got nil")
+
+			if tc.scrapeClass != nil {
+				probe.Spec.ScrapeClassName = tc.scrapeClass
+			}
+
+			tc.updateSpec(&probe.Spec)
+
+			probes, err := rs.SelectProbes(context.Background(), func(_ string, _ labels.Selector, appendFn cache.AppendFunc) error {
+				appendFn(probe)
+				return nil
+			})
+
+			require.NoError(t, err)
+			if tc.selected {
+				require.Len(t, probes, 1)
+			} else {
+				require.Empty(t, probes)
 			}
 		})
 	}
@@ -547,16 +767,3537 @@ func TestValidateScrapeIntervalAndTimeout(t *testing.T) {
 			expectedErr: true,
 		},
 	} {
-		t.Run(fmt.Sprintf("case %s", tc.scenario), func(t *testing.T) {
+		t.Run(tc.scenario, func(t *testing.T) {
 			for _, endpoint := range tc.smSpec.Endpoints {
 				err := validateScrapeIntervalAndTimeout(&tc.prometheus, endpoint.Interval, endpoint.ScrapeTimeout)
 				t.Logf("err %v", err)
-				if err != nil && !tc.expectedErr {
-					t.Fatalf("expected no error, got: %v", err)
+				if tc.expectedErr {
+					require.Error(t, err)
+					return
 				}
-				if err == nil && tc.expectedErr {
-					t.Fatalf("expected an error, got nil")
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestSelectServiceMonitors(t *testing.T) {
+	ca, err := os.ReadFile(certsDir + "ca.crt")
+	require.NoError(t, err)
+
+	cert, err := os.ReadFile(certsDir + "client.crt")
+	require.NoError(t, err)
+
+	key, err := os.ReadFile(certsDir + "client.key")
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		scenario    string
+		updateSpec  func(*monitoringv1.ServiceMonitorSpec)
+		selected    bool
+		scrapeClass *string
+	}{
+		{
+			scenario: "valid metric relabeling config",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					MetricRelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  "valid",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid metric relabeling config",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					MetricRelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  " invalid label name",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "valid relabeling config",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					RelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  "valid",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid relabeling config",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					RelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  " invalid label name",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "valid TLS config with CA, cert and key",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					TLSConfig: &monitoringv1.TLSConfig{
+						SafeTLSConfig: monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				})
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid TLS config with both CA and CAFile",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					TLSConfig: &monitoringv1.TLSConfig{
+						CAFile: "/etc/secrets/tls/ca.crt",
+						SafeTLSConfig: monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "invalid TLS config with both CA Secret and Configmap",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					TLSConfig: &monitoringv1.TLSConfig{
+						SafeTLSConfig: monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+								ConfigMap: &v1.ConfigMapKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "configmap",
+									},
+								},
+							},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "invalid TLS config with invalid CA data",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					TLSConfig: &monitoringv1.TLSConfig{
+						SafeTLSConfig: monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "invalid TLS config with cert and missing key",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					TLSConfig: &monitoringv1.TLSConfig{
+						SafeTLSConfig: monitoringv1.SafeTLSConfig{
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "invalid TLS config with key and missing cert",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					TLSConfig: &monitoringv1.TLSConfig{
+						SafeTLSConfig: monitoringv1.SafeTLSConfig{
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "invalid TLS config with key and invalid cert",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					TLSConfig: &monitoringv1.TLSConfig{
+						SafeTLSConfig: monitoringv1.SafeTLSConfig{
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "invalid proxyurl",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					ProxyURL: ptr.To("http://xxx-${dev}.svc.cluster.local:80"),
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "valid proxyurl",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					ProxyURL: ptr.To("http://proxy.svc.cluster.local:80"),
+				})
+			},
+			selected: true,
+		},
+		{
+			scenario:    "inexistent Scrape Class",
+			scrapeClass: ptr.To("inexistent"),
+			updateSpec: func(_ *monitoringv1.ServiceMonitorSpec) {
+			},
+			selected: false,
+		},
+		{
+			scenario:    "existent Scrape Class",
+			scrapeClass: ptr.To("existent"),
+			updateSpec: func(_ *monitoringv1.ServiceMonitorSpec) {
+			},
+			selected: true,
+		},
+		{
+			scenario: "Mixed Endpoints",
+			updateSpec: func(sm *monitoringv1.ServiceMonitorSpec) {
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					MetricRelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  " invalid label name",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+				sm.Endpoints = append(sm.Endpoints, monitoringv1.Endpoint{
+					MetricRelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  "valid",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			cs := fake.NewSimpleClientset(
+				&v1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "secret",
+						Namespace: "test",
+					},
+					Data: map[string][]byte{
+						"ca":         ca,
+						"invalid_ca": []byte("garbage"),
+						"cert":       cert,
+						"key":        key,
+					},
+				},
+				&v1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "configmap",
+						Namespace: "test",
+					},
+					Data: map[string]string{
+						"ca":   string(ca),
+						"cert": string(cert),
+					},
+				},
+			)
+
+			rs, err := NewResourceSelector(
+				newLogger(),
+				&monitoringv1.Prometheus{
+					Spec: monitoringv1.PrometheusSpec{
+						CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+							ScrapeClasses: []monitoringv1.ScrapeClass{
+								{
+									Name: "existent",
+								},
+							},
+						},
+					},
+				},
+				assets.NewStoreBuilder(cs.CoreV1(), cs.CoreV1()),
+				nil,
+				operator.NewMetrics(prometheus.NewPedanticRegistry()),
+				record.NewFakeRecorder(1),
+			)
+			require.NoError(t, err)
+
+			sm := &monitoringv1.ServiceMonitor{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test",
+					Namespace: "test",
+				},
+				Spec: monitoringv1.ServiceMonitorSpec{},
+			}
+
+			if tc.scrapeClass != nil {
+				sm.Spec.ScrapeClassName = tc.scrapeClass
+			}
+
+			tc.updateSpec(&sm.Spec)
+
+			sms, err := rs.SelectServiceMonitors(context.Background(), func(_ string, _ labels.Selector, appendFn cache.AppendFunc) error {
+				appendFn(sm)
+				return nil
+			})
+
+			require.NoError(t, err)
+			if tc.selected {
+				require.Len(t, sms, 1)
+			} else {
+				require.Empty(t, sms)
+			}
+		})
+	}
+}
+
+func TestSelectPodMonitors(t *testing.T) {
+	for _, tc := range []struct {
+		scenario    string
+		updateSpec  func(*monitoringv1.PodMonitorSpec)
+		selected    bool
+		scrapeClass *string
+	}{
+		{
+			scenario: "valid metric relabeling config",
+			updateSpec: func(pm *monitoringv1.PodMonitorSpec) {
+				pm.PodMetricsEndpoints = append(pm.PodMetricsEndpoints, monitoringv1.PodMetricsEndpoint{
+					MetricRelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  "valid",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid metric relabeling config",
+			updateSpec: func(pm *monitoringv1.PodMonitorSpec) {
+				pm.PodMetricsEndpoints = append(pm.PodMetricsEndpoints, monitoringv1.PodMetricsEndpoint{
+					MetricRelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  " invalid label name",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "valid relabeling config",
+			updateSpec: func(pm *monitoringv1.PodMonitorSpec) {
+				pm.PodMetricsEndpoints = append(pm.PodMetricsEndpoints, monitoringv1.PodMetricsEndpoint{
+					RelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  "valid",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid relabeling config",
+			updateSpec: func(pm *monitoringv1.PodMonitorSpec) {
+				pm.PodMetricsEndpoints = append(pm.PodMetricsEndpoints, monitoringv1.PodMetricsEndpoint{
+					RelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  " invalid label name",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "invalid proxyurl",
+			updateSpec: func(pm *monitoringv1.PodMonitorSpec) {
+				pm.PodMetricsEndpoints = append(pm.PodMetricsEndpoints, monitoringv1.PodMetricsEndpoint{
+					ProxyURL: ptr.To("http://xxx-${dev}.svc.cluster.local:80"),
+				})
+			},
+			selected: false,
+		},
+		{
+			scenario: "valid proxyurl",
+			updateSpec: func(pm *monitoringv1.PodMonitorSpec) {
+				pm.PodMetricsEndpoints = append(pm.PodMetricsEndpoints, monitoringv1.PodMetricsEndpoint{
+					ProxyURL: ptr.To("http://proxy.svc.cluster.local:80"),
+				})
+			},
+			selected: true,
+		},
+		{
+			scenario:    "Inexistent Scrape Class",
+			scrapeClass: ptr.To("inexistent"),
+			updateSpec: func(_ *monitoringv1.PodMonitorSpec) {
+			},
+			selected: false,
+		},
+		{
+			scenario:    "existent Scrape Class",
+			scrapeClass: ptr.To("existent"),
+			updateSpec: func(_ *monitoringv1.PodMonitorSpec) {
+			},
+			selected: true,
+		},
+		{
+			scenario: "Mixed Endpoints",
+			updateSpec: func(pm *monitoringv1.PodMonitorSpec) {
+				pm.PodMetricsEndpoints = append(pm.PodMetricsEndpoints, monitoringv1.PodMetricsEndpoint{
+					MetricRelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  " invalid label name",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+				pm.PodMetricsEndpoints = append(pm.PodMetricsEndpoints, monitoringv1.PodMetricsEndpoint{
+					MetricRelabelConfigs: []monitoringv1.RelabelConfig{
+						{
+							Action:       "Replace",
+							TargetLabel:  "valid",
+							SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+						},
+					},
+				})
+			},
+			selected: false,
+		},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			cs := fake.NewSimpleClientset()
+			rs, err := NewResourceSelector(
+				newLogger(),
+				&monitoringv1.Prometheus{
+					Spec: monitoringv1.PrometheusSpec{
+						CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+							ScrapeClasses: []monitoringv1.ScrapeClass{
+								{
+									Name: "existent",
+								},
+							},
+						},
+					},
+				},
+				assets.NewStoreBuilder(cs.CoreV1(), cs.CoreV1()),
+				nil,
+				operator.NewMetrics(prometheus.NewPedanticRegistry()),
+				record.NewFakeRecorder(1),
+			)
+			require.NoError(t, err)
+
+			pm := &monitoringv1.PodMonitor{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test",
+					Namespace: "test",
+				},
+			}
+
+			if tc.scrapeClass != nil {
+				pm.Spec.ScrapeClassName = tc.scrapeClass
+			}
+
+			tc.updateSpec(&pm.Spec)
+
+			sms, err := rs.SelectPodMonitors(context.Background(), func(_ string, _ labels.Selector, appendFn cache.AppendFunc) error {
+				appendFn(pm)
+				return nil
+			})
+
+			require.NoError(t, err)
+
+			if tc.selected {
+				require.Len(t, sms, 1)
+				return
+			}
+
+			require.Empty(t, sms)
+		})
+	}
+}
+
+func TestSelectScrapeConfigs(t *testing.T) {
+	ca, err := os.ReadFile(certsDir + "ca.crt")
+	require.NoError(t, err)
+
+	cert, err := os.ReadFile(certsDir + "client.crt")
+	require.NoError(t, err)
+
+	key, err := os.ReadFile(certsDir + "client.key")
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		scenario    string
+		updateSpec  func(*monitoringv1alpha1.ScrapeConfigSpec)
+		selected    bool
+		promVersion string
+		scrapeClass *string
+	}{
+		{
+			scenario: "valid relabeling config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.RelabelConfigs = []monitoringv1.RelabelConfig{
+					{
+						Action:       "Replace",
+						TargetLabel:  "valid",
+						SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+					},
 				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid relabeling config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.RelabelConfigs = []monitoringv1.RelabelConfig{
+					{
+						Action:       "Replace",
+						TargetLabel:  " invalid label name",
+						SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "valid metric relabeling config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.MetricRelabelConfigs = []monitoringv1.RelabelConfig{
+					{
+						Action:       "Replace",
+						TargetLabel:  "valid",
+						SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid metric relabeling config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.MetricRelabelConfigs = []monitoringv1.RelabelConfig{
+					{
+						Action:       "Replace",
+						TargetLabel:  " invalid label name",
+						SourceLabels: []monitoringv1.LabelName{"foo", "bar"},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "valid proxy config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ProxyConfig = monitoringv1.ProxyConfig{
+					ProxyURL:             ptr.To("http://no-proxy.com"),
+					NoProxy:              ptr.To("0.0.0.0"),
+					ProxyFromEnvironment: ptr.To(false),
+					ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+						"header": {
+							{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid proxy config with proxyConnectHeaders but no proxyUrl defined or proxyFromEnvironment set to true",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ProxyConfig = monitoringv1.ProxyConfig{
+					ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+						"header": {
+							{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "invalid proxy config with proxy from environment set to true but proxyUrl defined",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ProxyConfig = monitoringv1.ProxyConfig{
+					ProxyURL:             ptr.To("http://no-proxy.com"),
+					ProxyFromEnvironment: ptr.To(true),
+					ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+						"header": {
+							{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "invalid proxy config with proxyFromEnvironment set to true but noProxy defined",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ProxyConfig = monitoringv1.ProxyConfig{
+					NoProxy:              ptr.To("0.0.0.0"),
+					ProxyFromEnvironment: ptr.To(true),
+					ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+						"header": {
+							{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "invalid proxy config with invalid secret key",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ProxyConfig = monitoringv1.ProxyConfig{
+					ProxyURL:             ptr.To("http://no-proxy.com"),
+					NoProxy:              ptr.To("0.0.0.0"),
+					ProxyFromEnvironment: ptr.To(false),
+					ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+						"header": {
+							{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+							{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "invalid-key",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "invalid proxy config with noProxy defined and but no proxyUrl defined",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ProxyConfig = monitoringv1.ProxyConfig{
+					NoProxy: ptr.To("0.0.0.0"),
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "valid proxy config with muti header values",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ProxyConfig = monitoringv1.ProxyConfig{
+					ProxyURL:             ptr.To("http://no-proxy.com"),
+					NoProxy:              ptr.To("0.0.0.0"),
+					ProxyFromEnvironment: ptr.To(false),
+					ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+						"header": {
+							{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+							{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+							{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "invalid proxy config with one invalid secret key",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ProxyConfig = monitoringv1.ProxyConfig{
+					ProxyURL:             ptr.To("http://no-proxy.com"),
+					NoProxy:              ptr.To("0.0.0.0"),
+					ProxyFromEnvironment: ptr.To(false),
+					ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+						"header": {
+							{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "invalid-key",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "staticConfig with valid Labels",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.StaticConfigs = []monitoringv1alpha1.StaticConfig{
+					{
+						Labels: map[string]string{"owner": "prometheus"},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "staticConfig with invalid Labels",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.StaticConfigs = []monitoringv1alpha1.StaticConfig{
+					{
+						Labels: map[string]string{"1owner": "prometheus"},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "HTTP SD config with valid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HTTPSDConfigs = []monitoringv1alpha1.HTTPSDConfig{
+					{
+						URL: "http://example.com",
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected:    false,
+			promVersion: "2.29.0",
+		},
+		{
+			scenario: "HTTP SD config with invalid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HTTPSDConfigs = []monitoringv1alpha1.HTTPSDConfig{
+					{
+						URL: "http://example.com",
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							ProxyFromEnvironment: ptr.To(true),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected:    false,
+			promVersion: "2.29.0",
+		},
+		{
+			scenario: "HTTP SD config with valid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HTTPSDConfigs = []monitoringv1alpha1.HTTPSDConfig{
+					{
+						URL: "http://example.com",
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected:    false,
+			promVersion: "2.29.0",
+		},
+		{
+			scenario: "HTTP SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HTTPSDConfigs = []monitoringv1alpha1.HTTPSDConfig{
+					{
+						URL: "http://example.com",
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected:    false,
+			promVersion: "2.29.0",
+		},
+		{
+			scenario: "HTTP SD proxy config with invalid secret key",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HTTPSDConfigs = []monitoringv1alpha1.HTTPSDConfig{
+					{
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "invalid-key",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected:    false,
+			promVersion: "2.29.0",
+		},
+		{
+			scenario: "HTTP SD config in unsupported Prometheus version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HTTPSDConfigs = []monitoringv1alpha1.HTTPSDConfig{
+					{
+						URL: "http://example.com",
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			promVersion: "2.27.0",
+			selected:    false,
+		},
+		{
+			scenario: "Kubernetes SD config with valid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleNode,
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Kubernetes SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleNode,
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Kubernetes SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleNode,
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Kubernetes SD config with invalid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleNode,
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Kubernetes SD config with valid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleNode,
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Kubernetes SD config with invalid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleNode,
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							ProxyFromEnvironment: ptr.To(true),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Kubernetes SD config with invalid label selector",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Selectors: []monitoringv1alpha1.K8SSelectorConfig{
+							{
+								Label: ptr.To("app=example,env!=production,release in (v1, v2)"),
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Kubernetes SD config with invalid field selector",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Selectors: []monitoringv1alpha1.K8SSelectorConfig{
+							{
+								Field: ptr.To("status.phase=Running,metadata.name!=worker"),
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Kubernetes SD config with valid Selector Role",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleNode,
+						Selectors: []monitoringv1alpha1.K8SSelectorConfig{
+							{
+								Role: monitoringv1alpha1.KubernetesRoleNode,
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Kubernetes SD config with invalid Selector Role",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleNode,
+						Selectors: []monitoringv1alpha1.K8SSelectorConfig{
+							{
+								Role: monitoringv1alpha1.KubernetesRolePod,
+							},
+						},
+					},
+				}
+
+			},
+			selected: false,
+		},
+		{
+			scenario: "Kubernetes SD config with Role Pod",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRolePod,
+					},
+				}
+			},
+			promVersion: "2.51.0",
+			selected:    true,
+		},
+		{
+			scenario: "Kubernetes SD config with Role Pod but wrong version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRolePod,
+					},
+				}
+			},
+			promVersion: "2.31.0",
+			selected:    false,
+		},
+		{
+			scenario: "Kubernetes SD config with Role Endpoint",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleEndpoint,
+					},
+				}
+			},
+			promVersion: "2.51.0",
+			selected:    true,
+		},
+		{
+			scenario: "Kubernetes SD config with Role Endpoint but wrong version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleEndpoint,
+					},
+				}
+			},
+			promVersion: "2.31.0",
+			selected:    false,
+		},
+		{
+			scenario: "Kubernetes SD config with Role EndpointSlice",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleEndpointSlice,
+					},
+				}
+			},
+			promVersion: "2.51.0",
+			selected:    true,
+		},
+		{
+			scenario: "Kubernetes SD config with Role EndpointSlice but wrong version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleEndpointSlice,
+					},
+				}
+			},
+			promVersion: "2.31.0",
+			selected:    false,
+		},
+		{
+			scenario: "Kubernetes SD config with valid label and field selectors",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Role: monitoringv1alpha1.KubernetesRoleNode,
+						Selectors: []monitoringv1alpha1.K8SSelectorConfig{
+							{
+								Role:  monitoringv1alpha1.KubernetesRoleNode,
+								Label: ptr.To("app=example,env!=production,release in (v1, v2)"),
+								Field: ptr.To("status.phase=Running,metadata.name!=worker"),
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Kubernetes SD config with only apiServer specified",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						APIServer: ptr.To("https://kube-api-server-address:6443"),
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Kubernetes SD config with only namespaces.ownNamespace specified",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						Namespaces: &monitoringv1alpha1.NamespaceDiscovery{
+							IncludeOwnNamespace: ptr.To(true),
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Kubernetes SD config with both apiServer and namespaces.ownNamespace specified",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KubernetesSDConfigs = []monitoringv1alpha1.KubernetesSDConfig{
+					{
+						APIServer: ptr.To("https://kube-api-server-address:6443"),
+						Namespaces: &monitoringv1alpha1.NamespaceDiscovery{
+							IncludeOwnNamespace: ptr.To(true),
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Consul SD config with valid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ConsulSDConfigs = []monitoringv1alpha1.ConsulSDConfig{
+					{
+						Server: "example.com",
+						TokenRef: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Consul SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ConsulSDConfigs = []monitoringv1alpha1.ConsulSDConfig{
+					{
+						Server: "example.com",
+						TokenRef: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "wrong",
+							},
+							Key: "key1",
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Consul SD config with no secret ref provided",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ConsulSDConfigs = []monitoringv1alpha1.ConsulSDConfig{
+					{
+						Server: "example.com",
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Consul SD config with filter",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ConsulSDConfigs = []monitoringv1alpha1.ConsulSDConfig{
+					{
+						Server: "example.com",
+						Filter: ptr.To("Meta.env == \"qa\""),
+					},
+				}
+			},
+			selected:    true,
+			promVersion: "3.0.0",
+		},
+		{
+			scenario: "Consul SD config with filter but unsupported prometheus version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ConsulSDConfigs = []monitoringv1alpha1.ConsulSDConfig{
+					{
+						Server: "example.com",
+						Filter: ptr.To("Meta.env == \"qa\""),
+					},
+				}
+			},
+			selected:    false,
+			promVersion: "2.55.0",
+		},
+		{
+			scenario: "Consul SD proxy config with invalid secret key",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ConsulSDConfigs = []monitoringv1alpha1.ConsulSDConfig{
+					{
+						Server: "example.com",
+						TokenRef: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+					},
+					{
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "foo",
+										},
+										Key: "invalid-key",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Consul SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ConsulSDConfigs = []monitoringv1alpha1.ConsulSDConfig{
+					{
+						Server: "server",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Consul SD config with invalid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ConsulSDConfigs = []monitoringv1alpha1.ConsulSDConfig{
+					{
+						Server: "server",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Consul SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ConsulSDConfigs = []monitoringv1alpha1.ConsulSDConfig{
+					{
+						Server: "server",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Consul SD config with invalid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ConsulSDConfigs = []monitoringv1alpha1.ConsulSDConfig{
+					{
+						Server: "server",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "DNS SD config with no port specified for type other than SRV record",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DNSSDConfigs = []monitoringv1alpha1.DNSSDConfig{
+					{
+						Names: []string{"node.demo.do.prometheus.io"},
+						Type:  ptr.To(monitoringv1alpha1.DNSRecordTypeA),
+					},
+				}
+			},
+			promVersion: "2.51.0",
+			selected:    false,
+		},
+		{
+			scenario: "DNS SD config with MX record type and correct version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DNSSDConfigs = []monitoringv1alpha1.DNSSDConfig{
+					{
+						Names: []string{"node.demo.do.prometheus.io"},
+						Type:  ptr.To(monitoringv1alpha1.DNSRecordTypeMX),
+						Port:  ptr.To(int32(9900)),
+					},
+				}
+			},
+			promVersion: "2.51.0",
+			selected:    true,
+		},
+		{
+			scenario: "DNS SD config with A record type and correct version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DNSSDConfigs = []monitoringv1alpha1.DNSSDConfig{
+					{
+						Names: []string{"node.demo.do.prometheus.io"},
+						Type:  ptr.To(monitoringv1alpha1.DNSRecordTypeA),
+						Port:  ptr.To(int32(9900)),
+					},
+				}
+			},
+			promVersion: "2.51.0",
+			selected:    true,
+		},
+		{
+			scenario: "DNS SD config with port specified for type other than SRV record",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DNSSDConfigs = []monitoringv1alpha1.DNSSDConfig{
+					{
+						Names: []string{"node.demo.do.prometheus.io"},
+						Type:  ptr.To(monitoringv1alpha1.DNSRecordTypeA),
+						Port:  ptr.To(int32(9900)),
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "DNS SD config with NS record type and correct version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DNSSDConfigs = []monitoringv1alpha1.DNSSDConfig{
+					{
+						Names: []string{"node.demo.do.prometheus.io"},
+						Type:  ptr.To(monitoringv1alpha1.DNSRecordTypeNS),
+						Port:  ptr.To(int32(9900)),
+					},
+				}
+			},
+			promVersion: "2.51.0",
+			selected:    true,
+		},
+		{
+			scenario: "DNS SD config with MX record type and correct version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DNSSDConfigs = []monitoringv1alpha1.DNSSDConfig{
+					{
+						Names: []string{"node.demo.do.prometheus.io"},
+						Type:  ptr.To(monitoringv1alpha1.DNSRecordTypeMX),
+						Port:  ptr.To(int32(9900)),
+					},
+				}
+			},
+			promVersion: "2.51.0",
+			selected:    true,
+		},
+		{
+			scenario: "DNS SD config with A record type and correct version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DNSSDConfigs = []monitoringv1alpha1.DNSSDConfig{
+					{
+						Names: []string{"node.demo.do.prometheus.io"},
+						Type:  ptr.To(monitoringv1alpha1.DNSRecordTypeA),
+						Port:  ptr.To(int32(9900)),
+					},
+				}
+			},
+			promVersion: "2.51.0",
+			selected:    true,
+		},
+		{
+			scenario: "EC2 SD config with valid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.EC2SDConfigs = []monitoringv1alpha1.EC2SDConfig{
+					{
+						Region: ptr.To("us-east-1"),
+						AccessKey: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+						SecretKey: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key2",
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "EC2 SD config with no secret ref provided",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.EC2SDConfigs = []monitoringv1alpha1.EC2SDConfig{
+					{
+						Region: ptr.To("us-east-1"),
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "EC2 SD config with invalid secret ref for secretKey",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.EC2SDConfigs = []monitoringv1alpha1.EC2SDConfig{
+					{
+						Region: ptr.To("us-east-1"),
+						AccessKey: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+						SecretKey: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "wrong",
+							},
+							Key: "key2",
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "EC2 SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.EC2SDConfigs = []monitoringv1alpha1.EC2SDConfig{
+					{
+						Region: ptr.To("us-east-1"),
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "EC2 SD config with valid HTTPS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.EC2SDConfigs = []monitoringv1alpha1.EC2SDConfig{
+					{
+						Region: ptr.To("us-east-1"),
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+						RefreshInterval: ptr.To(monitoringv1.Duration("30s")),
+						EnableHTTP2:     ptr.To(true),
+					},
+				}
+			},
+			promVersion: "2.52.0",
+			selected:    true,
+		},
+		{
+			scenario: "EC2 SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.EC2SDConfigs = []monitoringv1alpha1.EC2SDConfig{
+					{
+						Region: ptr.To("us-east-1"),
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "EC2 SD config with valid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.EC2SDConfigs = []monitoringv1alpha1.EC2SDConfig{
+					{
+						Region: ptr.To("us-east-1"),
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			promVersion: "2.52.0",
+			selected:    true,
+		},
+		{
+			scenario: "Azure SD config with valid options for OAuth authentication method",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.AzureSDConfigs = []monitoringv1alpha1.AzureSDConfig{
+					{
+						TenantID: ptr.To("BBBB222B-B2B2-2B22-B222-2BB2222BB2B2"),
+						ClientID: ptr.To("333333CC-3C33-3333-CCC3-33C3CCCCC33C"),
+						ClientSecret: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Azure SD config with no client secret ref provided for OAuth authentication method",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.AzureSDConfigs = []monitoringv1alpha1.AzureSDConfig{
+					{
+						AuthenticationMethod: ptr.To(monitoringv1alpha1.AuthMethodTypeOAuth),
+						TenantID:             ptr.To("BBBB222B-B2B2-2B22-B222-2BB2222BB2B2"),
+						ClientID:             ptr.To("333333CC-3C33-3333-CCC3-33C3CCCCC33C"),
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Azure SD config with no tenant id provided for OAuth authentication method",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.AzureSDConfigs = []monitoringv1alpha1.AzureSDConfig{
+					{
+						AuthenticationMethod: ptr.To(monitoringv1alpha1.AuthMethodTypeOAuth),
+						ClientID:             ptr.To("333333CC-3C33-3333-CCC3-33C3CCCCC33C"),
+						ClientSecret: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Azure SD config with no client id provided for OAuth authentication method",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.AzureSDConfigs = []monitoringv1alpha1.AzureSDConfig{
+					{
+						AuthenticationMethod: ptr.To(monitoringv1alpha1.AuthMethodTypeOAuth),
+						TenantID:             ptr.To("BBBB222B-B2B2-2B22-B222-2BB2222BB2B2"),
+						ClientSecret: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Azure SD config without options provided for ManagedIdentity authentication method",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.AzureSDConfigs = []monitoringv1alpha1.AzureSDConfig{
+					{
+						AuthenticationMethod: ptr.To(monitoringv1alpha1.AuthMethodTypeManagedIdentity),
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Azure SD config without options provided for SDK authentication method",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.AzureSDConfigs = []monitoringv1alpha1.AzureSDConfig{
+					{
+						AuthenticationMethod: ptr.To(monitoringv1alpha1.AuthMethodTypeSDK),
+					},
+				}
+			},
+			promVersion: "2.52.0",
+			selected:    true,
+		},
+		{
+			scenario: "Azure SD config with SDK authentication method but unsupported prometheus version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.AzureSDConfigs = []monitoringv1alpha1.AzureSDConfig{
+					{
+						AuthenticationMethod: ptr.To(monitoringv1alpha1.AuthMethodTypeSDK),
+					},
+				}
+			},
+			promVersion: "2.51.0",
+			selected:    false,
+		},
+		{
+			scenario: "Azure SD config with ResourceGroup and prometheus version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.AzureSDConfigs = []monitoringv1alpha1.AzureSDConfig{
+					{
+						AuthenticationMethod: ptr.To(monitoringv1alpha1.AuthMethodTypeManagedIdentity),
+						ResourceGroup:        ptr.To("my-resource-group"),
+					},
+				}
+			},
+			promVersion: "2.51.0",
+			selected:    true,
+		},
+		{
+			scenario: "Azure SD config with ResourceGroup but unsupported prometheus version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.AzureSDConfigs = []monitoringv1alpha1.AzureSDConfig{
+					{
+						AuthenticationMethod: ptr.To(monitoringv1alpha1.AuthMethodTypeManagedIdentity),
+						ResourceGroup:        ptr.To("my-resource-group"),
+					},
+				}
+			},
+			promVersion: "2.34.0",
+			selected:    false,
+		},
+		{
+			scenario: "Azure SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.AzureSDConfigs = []monitoringv1alpha1.AzureSDConfig{
+					{
+						SubscriptionID: "11111111-1111-1111-1111-111111111111",
+						TenantID:       ptr.To("BBBB222B-B2B2-2B22-B222-2BB2222BB2B2"),
+						ClientID:       ptr.To("333333CC-3C33-3333-CCC3-33C3CCCCC33C"),
+						ClientSecret: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Azure SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.AzureSDConfigs = []monitoringv1alpha1.AzureSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "OpenStack SD config with valid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.OpenStackSDConfigs = []monitoringv1alpha1.OpenStackSDConfig{
+					{
+						Role:   monitoringv1alpha1.OpenStackRoleInstance,
+						Region: "RegionOne",
+						Password: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+						ApplicationCredentialSecret: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key2",
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "OpenStack SD config with invalid secret ref for password",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.OpenStackSDConfigs = []monitoringv1alpha1.OpenStackSDConfig{
+					{
+						Password: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "invalid",
+							},
+							Key: "key1",
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "OpenStack SD config with invalid secret ref for application credentials",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.OpenStackSDConfigs = []monitoringv1alpha1.OpenStackSDConfig{
+					{
+						ApplicationCredentialSecret: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key3",
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "OpenStack SD config with no secret ref provided",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.OpenStackSDConfigs = []monitoringv1alpha1.OpenStackSDConfig{
+					{
+						Role:   monitoringv1alpha1.OpenStackRoleHypervisor,
+						Region: "RegionTwo",
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "OpenStack SD config loadbalancer role in unsupported Prometheus version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.OpenStackSDConfigs = []monitoringv1alpha1.OpenStackSDConfig{
+					{
+						Role:   monitoringv1alpha1.OpenStackRoleLoadBalancer,
+						Region: "RegionTwo",
+					},
+				}
+			},
+			selected:    false,
+			promVersion: "3.1.0",
+		},
+		{
+			scenario: "OpenStack SD config loadbalancer role in supported Prometheus version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.OpenStackSDConfigs = []monitoringv1alpha1.OpenStackSDConfig{
+					{
+						Role:   monitoringv1alpha1.OpenStackRoleLoadBalancer,
+						Region: "RegionTwo",
+					},
+				}
+			},
+			selected:    true,
+			promVersion: "3.2.0",
+		},
+		{
+			scenario: "DigitalOcean SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DigitalOceanSDConfigs = []monitoringv1alpha1.DigitalOceanSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			promVersion: "2.40.0",
+			selected:    true,
+		},
+		{
+			scenario: "DigitalOcean SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DigitalOceanSDConfigs = []monitoringv1alpha1.DigitalOceanSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			promVersion: "2.40.0",
+			selected:    false,
+		},
+		{
+			scenario: "Digital Ocean SD config in unsupported Prometheus version",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DigitalOceanSDConfigs = []monitoringv1alpha1.DigitalOceanSDConfig{
+					{
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			promVersion: "2.11.0",
+			selected:    false,
+		},
+		{
+			scenario: "Kuma SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KumaSDConfigs = []monitoringv1alpha1.KumaSDConfig{
+					{
+						Server: "http://example.com",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Kuma SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KumaSDConfigs = []monitoringv1alpha1.KumaSDConfig{
+					{
+						Server: "http://example.com",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Kuma SD config with invalid server",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KumaSDConfigs = []monitoringv1alpha1.KumaSDConfig{
+					{
+						Server: "aaaaaa",
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Kuma SD config with valid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KumaSDConfigs = []monitoringv1alpha1.KumaSDConfig{
+					{
+						Server: "http://example.com",
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Kuma SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.KumaSDConfigs = []monitoringv1alpha1.KumaSDConfig{
+					{
+						Server: "http://example.com",
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Eureka SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.EurekaSDConfigs = []monitoringv1alpha1.EurekaSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Eureka SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.EurekaSDConfigs = []monitoringv1alpha1.EurekaSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Eureka SD config with valid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.EurekaSDConfigs = []monitoringv1alpha1.EurekaSDConfig{
+					{
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Eureka SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.EurekaSDConfigs = []monitoringv1alpha1.EurekaSDConfig{
+					{
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+
+		{
+			scenario: "Docker SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DockerSDConfigs = []monitoringv1alpha1.DockerSDConfig{
+					{
+						Host: "hostAddress",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Docker SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DockerSDConfigs = []monitoringv1alpha1.DockerSDConfig{
+					{
+						Host: "hostAddress",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Docker SD config with valid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DockerSDConfigs = []monitoringv1alpha1.DockerSDConfig{
+					{
+						Host: "hostAddress",
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Docker SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DockerSDConfigs = []monitoringv1alpha1.DockerSDConfig{
+					{
+						Host: "hostAddress",
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Linode SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LinodeSDConfigs = []monitoringv1alpha1.LinodeSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Linode SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LinodeSDConfigs = []monitoringv1alpha1.LinodeSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Linode SD config with valid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LinodeSDConfigs = []monitoringv1alpha1.LinodeSDConfig{
+					{
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Linode SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LinodeSDConfigs = []monitoringv1alpha1.LinodeSDConfig{
+					{
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Hetzner SD config with valid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HetznerSDConfigs = []monitoringv1alpha1.HetznerSDConfig{
+					{
+						Role: "hcloud",
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Hetzner SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HetznerSDConfigs = []monitoringv1alpha1.HetznerSDConfig{
+					{
+						Role: "hcloud",
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Hetzener SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HetznerSDConfigs = []monitoringv1alpha1.HetznerSDConfig{
+					{
+						Role: "hcloud",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Hetzner SD config with invalid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HetznerSDConfigs = []monitoringv1alpha1.HetznerSDConfig{
+					{
+						Role: "hcloud",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Hetzner SD config with valid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HetznerSDConfigs = []monitoringv1alpha1.HetznerSDConfig{
+					{
+						Role: "hcloud",
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Hetzner SD config with invalid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.HetznerSDConfigs = []monitoringv1alpha1.HetznerSDConfig{
+					{
+						Role: "hcloud",
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							ProxyFromEnvironment: ptr.To(true),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Nomad SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.NomadSDConfigs = []monitoringv1alpha1.NomadSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Nomad SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.NomadSDConfigs = []monitoringv1alpha1.NomadSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Nomad SD config with valid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.NomadSDConfigs = []monitoringv1alpha1.NomadSDConfig{
+					{
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Nomad SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.NomadSDConfigs = []monitoringv1alpha1.NomadSDConfig{
+					{
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Dockerswarm SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DockerSwarmSDConfigs = []monitoringv1alpha1.DockerSwarmSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Dockerswarm SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DockerSwarmSDConfigs = []monitoringv1alpha1.DockerSwarmSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Dockerswarm SD config with valid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DockerSwarmSDConfigs = []monitoringv1alpha1.DockerSwarmSDConfig{
+					{
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Dockerswarm SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.DockerSwarmSDConfigs = []monitoringv1alpha1.DockerSwarmSDConfig{
+					{
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "PuppetDB SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.PuppetDBSDConfigs = []monitoringv1alpha1.PuppetDBSDConfig{
+					{
+						URL: "https://example.com",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "PuppetDB SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.PuppetDBSDConfigs = []monitoringv1alpha1.PuppetDBSDConfig{
+					{
+						URL: "https://example.com",
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "PuppetDB SD config with valid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.PuppetDBSDConfigs = []monitoringv1alpha1.PuppetDBSDConfig{
+					{
+						URL: "https://example.com",
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "PuppetDB SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.PuppetDBSDConfigs = []monitoringv1alpha1.PuppetDBSDConfig{
+					{
+						URL: "https://example.com",
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "PuppetDB SD config with invalid URL",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.PuppetDBSDConfigs = []monitoringv1alpha1.PuppetDBSDConfig{
+					{
+						URL: "www.percent-off.com",
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "LightSail SD config with valid TLS Config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LightSailSDConfigs = []monitoringv1alpha1.LightSailSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "cert",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								Key: "key",
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "LightSail SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LightSailSDConfigs = []monitoringv1alpha1.LightSailSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "LightSail SD config with valid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LightSailSDConfigs = []monitoringv1alpha1.LightSailSDConfig{
+					{
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "LightSail SD config with invalid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LightSailSDConfigs = []monitoringv1alpha1.LightSailSDConfig{
+					{
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							ProxyFromEnvironment: ptr.To(true),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "LightSail SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LightSailSDConfigs = []monitoringv1alpha1.LightSailSDConfig{
+					{
+						Authorization: &monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+
+		{
+			scenario: "LightSail SD config with valid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LightSailSDConfigs = []monitoringv1alpha1.LightSailSDConfig{
+					{
+						Region: ptr.To("us-east-1"),
+						AccessKey: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+						SecretKey: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key2",
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "LightSail SD config with no secret ref provided",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LightSailSDConfigs = []monitoringv1alpha1.LightSailSDConfig{
+					{
+						Region: ptr.To("us-east-1"),
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "LightSail SD config with invalid secret ref for accessKey",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LightSailSDConfigs = []monitoringv1alpha1.LightSailSDConfig{
+					{
+						Region: ptr.To("us-east-1"),
+						AccessKey: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "wrong",
+							},
+							Key: "key1",
+						},
+						SecretKey: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key2",
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "LightSail SD config with invalid secret ref for secretKey",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.LightSailSDConfigs = []monitoringv1alpha1.LightSailSDConfig{
+					{
+						Region: ptr.To("us-east-1"),
+						AccessKey: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+						SecretKey: &v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "wrong",
+							},
+							Key: "key2",
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "OVHCloud SD config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.OVHCloudSDConfigs = []monitoringv1alpha1.OVHCloudSDConfig{
+					{
+						ApplicationKey: "ApplicationKey",
+						ApplicationSecret: v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+						ConsumerKey: v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key2",
+						},
+						Service:  monitoringv1alpha1.OVHServiceVPS,
+						Endpoint: ptr.To("127.0.0.1"),
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Scaleway SD config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ScalewaySDConfigs = []monitoringv1alpha1.ScalewaySDConfig{
+					{
+						AccessKey: "AccessKey",
+						SecretKey: v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "secret",
+							},
+							Key: "key1",
+						},
+						ProjectID: "1",
+						Role:      monitoringv1alpha1.ScalewayRoleInstance,
+
+						Zone:       ptr.To("beijing-1"),
+						Port:       ptr.To(int32(23456)),
+						ApiURL:     ptr.To("https://api.scaleway.com/"),
+						NameFilter: ptr.To("name"),
+						TagsFilter: []string{"aa", "bb"},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Scaleway SD config with invalid secret ref for secretKey",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ScalewaySDConfigs = []monitoringv1alpha1.ScalewaySDConfig{
+					{
+						AccessKey: "AccessKey",
+						SecretKey: v1.SecretKeySelector{
+							LocalObjectReference: v1.LocalObjectReference{
+								Name: "wrong",
+							},
+							Key: "key1",
+						},
+						ProjectID: "1",
+						Role:      monitoringv1alpha1.ScalewayRoleInstance,
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Scaleway SD config with invalid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ScalewaySDConfigs = []monitoringv1alpha1.ScalewaySDConfig{
+					{
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							ProxyFromEnvironment: ptr.To(true),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Scaleway SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.ScalewaySDConfigs = []monitoringv1alpha1.ScalewaySDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									Key: "invalid_ca",
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Ionos SD config with valid TLS config",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.IonosSDConfigs = []monitoringv1alpha1.IonosSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+									Key: "ca",
+								},
+							},
+							Cert: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+									Key: "cert",
+								},
+							},
+							KeySecret: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "secret",
+								},
+								Key: "key",
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Ionos SD config with invalid TLS config with invalid CA data",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.IonosSDConfigs = []monitoringv1alpha1.IonosSDConfig{
+					{
+						TLSConfig: &monitoringv1.SafeTLSConfig{
+							CA: monitoringv1.SecretOrConfigMap{
+								Secret: &v1.SecretKeySelector{
+									LocalObjectReference: v1.LocalObjectReference{
+										Name: "secret",
+									},
+									Key: "invalid-ca",
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Ionos SD config with valid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.IonosSDConfigs = []monitoringv1alpha1.IonosSDConfig{
+					{
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							NoProxy:              ptr.To("0.0.0.0"),
+							ProxyFromEnvironment: ptr.To(false),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: true,
+		},
+		{
+			scenario: "Ionos SD config with invalid proxy settings",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.IonosSDConfigs = []monitoringv1alpha1.IonosSDConfig{
+					{
+						ProxyConfig: monitoringv1.ProxyConfig{
+							ProxyURL:             ptr.To("http://no-proxy.com"),
+							ProxyFromEnvironment: ptr.To(true),
+							ProxyConnectHeader: map[string][]v1.SecretKeySelector{
+								"header": {
+									{
+										LocalObjectReference: v1.LocalObjectReference{
+											Name: "secret",
+										},
+										Key: "key1",
+									},
+								},
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Ionos SD config with invalid secret ref",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.IonosSDConfigs = []monitoringv1alpha1.IonosSDConfig{
+					{
+						Authorization: monitoringv1.SafeAuthorization{
+							Credentials: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: "wrong",
+								},
+								Key: "key1",
+							},
+						},
+					},
+				}
+			},
+			selected: false,
+		},
+		{
+			scenario: "Inexistent Scrape Class",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.OpenStackSDConfigs = []monitoringv1alpha1.OpenStackSDConfig{
+					{
+						Role:   monitoringv1alpha1.OpenStackRoleHypervisor,
+						Region: "RegionTwo",
+					},
+				}
+			},
+			selected:    false,
+			scrapeClass: ptr.To("inexistent"),
+		},
+		{
+			scenario: "inexistent Scrape Class",
+			updateSpec: func(sc *monitoringv1alpha1.ScrapeConfigSpec) {
+				sc.OpenStackSDConfigs = []monitoringv1alpha1.OpenStackSDConfig{
+					{
+						Role:   monitoringv1alpha1.OpenStackRoleHypervisor,
+						Region: "RegionTwo",
+					},
+				}
+			},
+			selected:    true,
+			scrapeClass: ptr.To("existent"),
+		},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			cs := fake.NewSimpleClientset(
+				&v1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "secret",
+						Namespace: "test",
+					},
+					Data: map[string][]byte{
+						"key1":       []byte("val1"),
+						"key2":       []byte("val2"),
+						"ca":         ca,
+						"invalid_ca": []byte("garbage"),
+						"cert":       cert,
+						"key":        key,
+					},
+				},
+				&v1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "configmap",
+						Namespace: "test",
+					},
+					Data: map[string]string{
+						"key1": "val1",
+					},
+				},
+			)
+
+			rs, err := NewResourceSelector(
+				newLogger(),
+				&monitoringv1.Prometheus{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test",
+						Namespace: "test",
+					},
+					Spec: monitoringv1.PrometheusSpec{
+						CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+							Version: tc.promVersion,
+							ScrapeClasses: []monitoringv1.ScrapeClass{
+								{
+									Name: "existent",
+								},
+							},
+						},
+					},
+				},
+				assets.NewStoreBuilder(cs.CoreV1(), cs.CoreV1()),
+				nil,
+				operator.NewMetrics(prometheus.NewPedanticRegistry()),
+				record.NewFakeRecorder(1),
+			)
+			require.NoError(t, err)
+
+			sc := &monitoringv1alpha1.ScrapeConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test",
+					Namespace: "test",
+				},
+			}
+
+			if tc.scrapeClass != nil {
+				sc.Spec.ScrapeClassName = tc.scrapeClass
+			}
+
+			tc.updateSpec(&sc.Spec)
+
+			sms, err := rs.SelectScrapeConfigs(context.Background(), func(_ string, _ labels.Selector, appendFn cache.AppendFunc) error {
+				appendFn(sc)
+				return nil
+			})
+
+			require.NoError(t, err)
+			if tc.selected {
+				require.Len(t, sms, 1)
+			} else {
+				require.Empty(t, sms)
 			}
 		})
 	}

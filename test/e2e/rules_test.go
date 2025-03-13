@@ -18,15 +18,20 @@ import (
 	"context"
 	"testing"
 
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	monitoringv1ac "github.com/prometheus-operator/prometheus-operator/pkg/client/applyconfiguration/monitoring/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	monitoringv1ac "github.com/prometheus-operator/prometheus-operator/pkg/client/applyconfiguration/monitoring/v1"
 )
 
 func TestPrometheusRuleCRDValidation(t *testing.T) {
+	keepFiringFor := monitoringv1.NonEmptyDuration("5m")
+	emptyDuration := monitoringv1.NonEmptyDuration("")
+
 	skipPrometheusTests(t)
 	t.Parallel()
 
@@ -75,6 +80,16 @@ func TestPrometheusRuleCRDValidation(t *testing.T) {
 					{
 						Name:  "rule2",
 						Rules: []monitoringv1.Rule{},
+					},
+				},
+			},
+		},
+		{
+			name: "empty-rule",
+			promRuleSpec: monitoringv1.PrometheusRuleSpec{
+				Groups: []monitoringv1.RuleGroup{
+					{
+						Name: "empty",
 					},
 				},
 			},
@@ -138,6 +153,41 @@ func TestPrometheusRuleCRDValidation(t *testing.T) {
 					},
 				},
 			},
+		},
+		{
+			name: "valid-keep-firing-for",
+			promRuleSpec: monitoringv1.PrometheusRuleSpec{
+				Groups: []monitoringv1.RuleGroup{
+					{
+						Name: "test",
+						Rules: []monitoringv1.Rule{
+							{
+								Record:        "rule1",
+								Expr:          intstr.FromString("vector(0)"),
+								KeepFiringFor: &keepFiringFor,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "invalid-keep-firing-for",
+			promRuleSpec: monitoringv1.PrometheusRuleSpec{
+				Groups: []monitoringv1.RuleGroup{
+					{
+						Name: "test",
+						Rules: []monitoringv1.Rule{
+							{
+								Record:        "rule1",
+								Expr:          intstr.FromString("vector(0)"),
+								KeepFiringFor: &emptyDuration,
+							},
+						},
+					},
+				},
+			},
+			expectedError: true,
 		},
 	}
 
@@ -303,11 +353,11 @@ func TestPrometheusRuleApply(t *testing.T) {
 			)
 
 			if tc.expectedErr {
-				assert.Error(t, err)
+				require.Error(t, err)
 				return
 			}
 
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, tc.expected, res.Spec.Groups)
 		})
 	}

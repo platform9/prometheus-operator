@@ -17,8 +17,9 @@ package v1beta1
 import (
 	"testing"
 
+	"k8s.io/utils/ptr"
+
 	monitoringv1beta1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1beta1"
-	"k8s.io/utils/pointer"
 )
 
 func TestValidateAlertmanagerConfig(t *testing.T) {
@@ -228,7 +229,7 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			expectErr: true,
 		},
 		{
-			name: "Test fail to validate PushoverConfigs - missing user key",
+			name: "Test fail to validate PushoverConfigs - missing user key and user key file",
 			in: &monitoringv1beta1.AlertmanagerConfig{
 				Spec: monitoringv1beta1.AlertmanagerConfigSpec{
 					Receivers: []monitoringv1beta1.Receiver{
@@ -239,6 +240,80 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 							Name: "different",
 							PushoverConfigs: []monitoringv1beta1.PushoverConfig{
 								{},
+							},
+						},
+					},
+				},
+			},
+			expectErr: true,
+		},
+		{
+			name: "Test fail to validate PushoverConfigs - missing token and token file",
+			in: &monitoringv1beta1.AlertmanagerConfig{
+				Spec: monitoringv1beta1.AlertmanagerConfigSpec{
+					Receivers: []monitoringv1beta1.Receiver{
+						{
+							Name: "same",
+						},
+						{
+							Name: "different",
+							PushoverConfigs: []monitoringv1beta1.PushoverConfig{
+								{
+									UserKey: &monitoringv1beta1.SecretKeySelector{
+										Name: "creds",
+										Key:  "user",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectErr: true,
+		},
+		{
+			name: "Test fail to validate PushoverConfigs - token and tokenFile has be configured",
+			in: &monitoringv1beta1.AlertmanagerConfig{
+				Spec: monitoringv1beta1.AlertmanagerConfigSpec{
+					Receivers: []monitoringv1beta1.Receiver{
+						{
+							Name: "same",
+						},
+						{
+							Name: "different",
+							PushoverConfigs: []monitoringv1beta1.PushoverConfig{
+								{
+									Token: &monitoringv1beta1.SecretKeySelector{
+										Name: "creds",
+										Key:  "user",
+									},
+									TokenFile: ptr.To("/path/token_file"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectErr: true,
+		},
+		{
+			name: "Test fail to validate PushoverConfigs - userKey and userKeyFile has be configured",
+			in: &monitoringv1beta1.AlertmanagerConfig{
+				Spec: monitoringv1beta1.AlertmanagerConfigSpec{
+					Receivers: []monitoringv1beta1.Receiver{
+						{
+							Name: "same",
+						},
+						{
+							Name: "different",
+							PushoverConfigs: []monitoringv1beta1.PushoverConfig{
+								{
+									UserKey: &monitoringv1beta1.SecretKeySelector{
+										Name: "creds",
+										Key:  "user",
+									},
+									UserKeyFile: ptr.To("/path/user_key_file"),
+								},
 							},
 						},
 					},
@@ -354,6 +429,7 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 											ID:       "a",
 											Name:     "b",
 											Username: "c",
+											Type:     "user",
 										},
 									},
 								},
@@ -381,7 +457,7 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 							},
 							WebhookConfigs: []monitoringv1beta1.WebhookConfig{
 								{
-									URL: pointer.String("https://www.test.com"),
+									URL: ptr.To("https://www.test.com"),
 									URLSecret: &monitoringv1beta1.SecretKeySelector{
 										Name: "creds",
 										Key:  "url",
