@@ -1,4 +1,4 @@
-// Copyright 2019 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,14 +17,12 @@ package admission
 import (
 	"encoding/json"
 	"fmt"
-
-	"github.com/pkg/errors"
 )
 
 func generatePatchesForNonStringLabelsAnnotations(content []byte) ([]string, error) {
 	groups := &RuleGroups{}
 	if err := json.Unmarshal(content, groups); err != nil {
-		return nil, errors.Wrap(err, "cannot unmarshal RuleGroups")
+		return nil, fmt.Errorf("cannot unmarshal RuleGroups: %w", err)
 	}
 
 	patches := new([]string)
@@ -42,7 +40,7 @@ func generatePatchesForNonStringLabelsAnnotations(content []byte) ([]string, err
 	return *patches, nil
 }
 
-func patchIfNotString(patches *[]string, gi, ri int, typ, key string, val interface{}) {
+func patchIfNotString(patches *[]string, gi, ri int, typ, key string, val any) {
 	if _, ok := val.(string); ok || val == nil {
 		// Kubernetes does not let nil values get this far.
 		// Keeping it here for the sake of clarity of behavior.

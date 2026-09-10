@@ -16,25 +16,80 @@
 
 package v1beta1
 
-// PushoverConfigApplyConfiguration represents an declarative configuration of the PushoverConfig type for use
+import (
+	v1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+)
+
+// PushoverConfigApplyConfiguration represents a declarative configuration of the PushoverConfig type for use
 // with apply.
+//
+// PushoverConfig configures notifications via Pushover.
+// See https://prometheus.io/docs/alerting/latest/configuration/#pushover_config
 type PushoverConfigApplyConfiguration struct {
-	SendResolved *bool                                `json:"sendResolved,omitempty"`
-	UserKey      *SecretKeySelectorApplyConfiguration `json:"userKey,omitempty"`
-	Token        *SecretKeySelectorApplyConfiguration `json:"token,omitempty"`
-	Title        *string                              `json:"title,omitempty"`
-	Message      *string                              `json:"message,omitempty"`
-	URL          *string                              `json:"url,omitempty"`
-	URLTitle     *string                              `json:"urlTitle,omitempty"`
-	Sound        *string                              `json:"sound,omitempty"`
-	Priority     *string                              `json:"priority,omitempty"`
-	Retry        *string                              `json:"retry,omitempty"`
-	Expire       *string                              `json:"expire,omitempty"`
-	HTML         *bool                                `json:"html,omitempty"`
-	HTTPConfig   *HTTPConfigApplyConfiguration        `json:"httpConfig,omitempty"`
+	// sendResolved defines whether or not to notify about resolved alerts.
+	SendResolved *bool `json:"sendResolved,omitempty"`
+	// userKey defines the secret's key that contains the recipient user's user key.
+	// The secret needs to be in the same namespace as the AlertmanagerConfig
+	// object and accessible by the Prometheus Operator.
+	// Either `userKey` or `userKeyFile` is required.
+	UserKey *SecretKeySelectorApplyConfiguration `json:"userKey,omitempty"`
+	// userKeyFile defines the user key file that contains the recipient user's user key.
+	// Either `userKey` or `userKeyFile` is required.
+	// It requires Alertmanager >= v0.26.0.
+	UserKeyFile *string `json:"userKeyFile,omitempty"`
+	// token defines the secret's key that contains the registered application's API token.
+	// See https://pushover.net/apps for application registration.
+	// The secret needs to be in the same namespace as the AlertmanagerConfig
+	// object and accessible by the Prometheus Operator.
+	// Either `token` or `tokenFile` is required.
+	Token *SecretKeySelectorApplyConfiguration `json:"token,omitempty"`
+	// tokenFile defines the token file that contains the registered application's API token.
+	// See https://pushover.net/apps for application registration.
+	// Either `token` or `tokenFile` is required.
+	// It requires Alertmanager >= v0.26.0.
+	TokenFile *string `json:"tokenFile,omitempty"`
+	// title defines the notification title displayed in the Pushover message.
+	// This appears as the bold header text in the notification.
+	Title *string `json:"title,omitempty"`
+	// message defines the notification message content.
+	// This is the main body text of the Pushover notification.
+	Message *string `json:"message,omitempty"`
+	// url defines a supplementary URL shown alongside the message.
+	// This creates a clickable link within the Pushover notification.
+	URL *string `json:"url,omitempty"`
+	// urlTitle defines a title for the supplementary URL.
+	// If not specified, the raw URL is shown instead.
+	URLTitle *string `json:"urlTitle,omitempty"`
+	// ttl defines the time to live for the alert notification.
+	// This determines how long the notification remains active before expiring.
+	TTL *v1.Duration `json:"ttl,omitempty"`
+	// device defines the name of a specific device to send the notification to.
+	// If not specified, the notification is sent to all user's devices.
+	Device *string `json:"device,omitempty"`
+	// sound defines the name of one of the sounds supported by device clients.
+	// This overrides the user's default sound choice for this notification.
+	Sound *string `json:"sound,omitempty"`
+	// priority defines the notification priority level.
+	// See https://pushover.net/api#priority for valid values and behavior.
+	Priority *string `json:"priority,omitempty"`
+	// retry defines how often the Pushover servers will send the same notification to the user.
+	// Must be at least 30 seconds. Only applies to priority 2 notifications.
+	Retry *string `json:"retry,omitempty"`
+	// expire defines how long your notification will continue to be retried for,
+	// unless the user acknowledges the notification. Only applies to priority 2 notifications.
+	Expire *string `json:"expire,omitempty"`
+	// html defines whether notification message is HTML or plain text.
+	// When true, the message can include HTML formatting tags.
+	// html and monospace formatting are mutually exclusive.
+	HTML *bool `json:"html,omitempty"`
+	// monospace optional HTML/monospace formatting for the message, see https://pushover.net/api#html
+	// html and monospace formatting are mutually exclusive.
+	Monospace *bool `json:"monospace,omitempty"`
+	// httpConfig defines the HTTP client configuration for Pushover API requests.
+	HTTPConfig *HTTPConfigApplyConfiguration `json:"httpConfig,omitempty"`
 }
 
-// PushoverConfigApplyConfiguration constructs an declarative configuration of the PushoverConfig type for use with
+// PushoverConfigApplyConfiguration constructs a declarative configuration of the PushoverConfig type for use with
 // apply.
 func PushoverConfig() *PushoverConfigApplyConfiguration {
 	return &PushoverConfigApplyConfiguration{}
@@ -56,11 +111,27 @@ func (b *PushoverConfigApplyConfiguration) WithUserKey(value *SecretKeySelectorA
 	return b
 }
 
+// WithUserKeyFile sets the UserKeyFile field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the UserKeyFile field is set to the value of the last call.
+func (b *PushoverConfigApplyConfiguration) WithUserKeyFile(value string) *PushoverConfigApplyConfiguration {
+	b.UserKeyFile = &value
+	return b
+}
+
 // WithToken sets the Token field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Token field is set to the value of the last call.
 func (b *PushoverConfigApplyConfiguration) WithToken(value *SecretKeySelectorApplyConfiguration) *PushoverConfigApplyConfiguration {
 	b.Token = value
+	return b
+}
+
+// WithTokenFile sets the TokenFile field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the TokenFile field is set to the value of the last call.
+func (b *PushoverConfigApplyConfiguration) WithTokenFile(value string) *PushoverConfigApplyConfiguration {
+	b.TokenFile = &value
 	return b
 }
 
@@ -93,6 +164,22 @@ func (b *PushoverConfigApplyConfiguration) WithURL(value string) *PushoverConfig
 // If called multiple times, the URLTitle field is set to the value of the last call.
 func (b *PushoverConfigApplyConfiguration) WithURLTitle(value string) *PushoverConfigApplyConfiguration {
 	b.URLTitle = &value
+	return b
+}
+
+// WithTTL sets the TTL field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the TTL field is set to the value of the last call.
+func (b *PushoverConfigApplyConfiguration) WithTTL(value v1.Duration) *PushoverConfigApplyConfiguration {
+	b.TTL = &value
+	return b
+}
+
+// WithDevice sets the Device field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Device field is set to the value of the last call.
+func (b *PushoverConfigApplyConfiguration) WithDevice(value string) *PushoverConfigApplyConfiguration {
+	b.Device = &value
 	return b
 }
 
@@ -133,6 +220,14 @@ func (b *PushoverConfigApplyConfiguration) WithExpire(value string) *PushoverCon
 // If called multiple times, the HTML field is set to the value of the last call.
 func (b *PushoverConfigApplyConfiguration) WithHTML(value bool) *PushoverConfigApplyConfiguration {
 	b.HTML = &value
+	return b
+}
+
+// WithMonospace sets the Monospace field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Monospace field is set to the value of the last call.
+func (b *PushoverConfigApplyConfiguration) WithMonospace(value bool) *PushoverConfigApplyConfiguration {
+	b.Monospace = &value
 	return b
 }
 

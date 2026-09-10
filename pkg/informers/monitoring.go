@@ -1,4 +1,4 @@
-// Copyright 2020 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,12 @@ package informers
 import (
 	"time"
 
-	informers "github.com/prometheus-operator/prometheus-operator/pkg/client/informers/externalversions"
-	monitoring "github.com/prometheus-operator/prometheus-operator/pkg/client/versioned"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
+
+	informers "github.com/prometheus-operator/prometheus-operator/pkg/client/informers/externalversions"
+	monitoring "github.com/prometheus-operator/prometheus-operator/pkg/client/versioned"
 )
 
 // NewMonitoringInformerFactories creates factories for monitoring resources

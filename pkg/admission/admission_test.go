@@ -1,4 +1,4 @@
-// Copyright 2019 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,16 +19,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/stretchr/testify/require"
+	"gotest.tools/v3/golden"
 	v1 "k8s.io/api/admission/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 
@@ -40,7 +41,7 @@ func TestMutateRule(t *testing.T) {
 	ts := server(api().servePrometheusRulesMutate)
 	defer ts.Close()
 
-	resp := sendAdmissionReview(t, ts, goodRulesWithAnnotations)
+	resp := sendAdmissionReview(t, ts, golden.Get(t, "goodRulesWithAnnotations.golden"))
 
 	if len(resp.Response.Patch) == 0 {
 		t.Errorf("Expected a patch to be applied but found none")
@@ -51,7 +52,7 @@ func TestMutateRuleNoAnnotations(t *testing.T) {
 	ts := server(api().servePrometheusRulesMutate)
 	defer ts.Close()
 
-	resp := sendAdmissionReview(t, ts, badRulesNoAnnotations)
+	resp := sendAdmissionReview(t, ts, golden.Get(t, "badRulesNoAnnotations.golden"))
 
 	if len(resp.Response.Patch) == 0 {
 		t.Errorf("Expected a patch to be applied but found none")
@@ -62,7 +63,7 @@ func TestAdmitGoodRule(t *testing.T) {
 	ts := server(api().servePrometheusRulesValidate)
 	defer ts.Close()
 
-	resp := sendAdmissionReview(t, ts, goodRulesWithAnnotations)
+	resp := sendAdmissionReview(t, ts, golden.Get(t, "goodRulesWithAnnotations.golden"))
 
 	if !resp.Response.Allowed {
 		t.Errorf("Expected admission to be allowed but it was not")
@@ -73,7 +74,7 @@ func TestAdmitGoodRuleExternalLabels(t *testing.T) {
 	ts := server(api().servePrometheusRulesValidate)
 	defer ts.Close()
 
-	resp := sendAdmissionReview(t, ts, goodRulesWithExternalLabelsInAnnotations)
+	resp := sendAdmissionReview(t, ts, golden.Get(t, "goodRulesWithExternalLabelsInAnnotations.golden"))
 
 	if !resp.Response.Allowed {
 		t.Errorf("Expected admission to be allowed but it was not")
@@ -84,7 +85,7 @@ func TestAdmitBadRule(t *testing.T) {
 	ts := server(api().servePrometheusRulesValidate)
 	defer ts.Close()
 
-	resp := sendAdmissionReview(t, ts, badRulesNoAnnotations)
+	resp := sendAdmissionReview(t, ts, golden.Get(t, "badRulesNoAnnotations.golden"))
 
 	if resp.Response.Allowed {
 		t.Errorf("Expected admission to not be allowed but it was")
@@ -115,7 +116,7 @@ func TestAdmitBadRuleWithBooleanInAnnotations(t *testing.T) {
 	ts := server(api().servePrometheusRulesValidate)
 	defer ts.Close()
 
-	resp := sendAdmissionReview(t, ts, badRulesWithBooleanInAnnotations)
+	resp := sendAdmissionReview(t, ts, golden.Get(t, "badRulesWithBooleanInAnnotations.golden"))
 
 	if resp.Response.Allowed {
 		t.Errorf("Expected admission to not be allowed but it was")
@@ -129,7 +130,7 @@ func TestAdmitBadRuleWithBooleanInAnnotations(t *testing.T) {
 }
 
 func TestMutateNonStringsToStrings(t *testing.T) {
-	request := nonStringsInLabelsAnnotations
+	request := golden.Get(t, "nonStringsInLabelsAnnotations.golden")
 	ts := server(api().servePrometheusRulesMutate)
 	resp := sendAdmissionReview(t, ts, request)
 	if len(resp.Response.Patch) == 0 {
@@ -138,16 +139,12 @@ func TestMutateNonStringsToStrings(t *testing.T) {
 
 	// Apply patch to original request
 	patchObj, err := jsonpatch.DecodePatch(resp.Response.Patch)
-	if err != nil {
-		t.Fatal(err, "Expected a valid patch")
-	}
+	require.NoError(t, err)
+
 	rev := v1.AdmissionReview{}
-	deserializer.Decode(nonStringsInLabelsAnnotations, nil, &rev)
+	deserializer.Decode(golden.Get(t, "nonStringsInLabelsAnnotations.golden"), nil, &rev)
 	rev.Request.Object.Raw, err = patchObj.Apply(rev.Request.Object.Raw)
-	if err != nil {
-		fmt.Println(string(resp.Response.Patch))
-		t.Fatal(err, "Expected to successfully apply patch")
-	}
+	require.NoErrorf(t, err, string(resp.Response.Patch))
 	request, _ = json.Marshal(rev)
 
 	// Sent patched request to validation endpoint
@@ -163,7 +160,7 @@ func TestMutateNonStringsToStrings(t *testing.T) {
 
 // TestAlertmanagerConfigAdmission tests the admission controller
 // validation of the AlertmanagerConfig but does not aim to cover
-// all the edge cases of the Validate function in pkg/alertmanager
+// all the edge cases of the Validate function in pkg/alertmanager.
 func TestAlertmanagerConfigAdmission(t *testing.T) {
 	ts := server(api().serveAlertmanagerConfigValidate)
 	t.Cleanup(ts.Close)
@@ -171,348 +168,62 @@ func TestAlertmanagerConfigAdmission(t *testing.T) {
 	testCases := []struct {
 		name                   string
 		apiVersion             string
-		spec                   string
+		golden                 string
 		expectAdmissionAllowed bool
 	}{
 		{
-			name:       "Test reject on duplicate receiver",
-			apiVersion: "v1alpha1",
-			spec: `{
-  "route": {
-    "groupBy": [
-      "job"
-    ],
-    "groupWait": "30s",
-    "groupInterval": "5m",
-    "repeatInterval": "12h",
-    "receiver": "wechat-example"
-  },
-  "receivers": [
-    {
-      "name": "wechat-example"
-    },
-    {
-      "name": "wechat-example"
-    }
-  ]
-}`,
+			name:                   "Test reject on duplicate receiver",
+			apiVersion:             "v1alpha1",
+			golden:                 "Test_reject_on_duplicate_receiver_v1alpha1.golden",
 			expectAdmissionAllowed: false,
 		},
 		{
-			name:       "Test reject on duplicate receiver",
-			apiVersion: "v1beta1",
-			spec: `{
-  "route": {
-    "groupBy": [
-      "job"
-    ],
-    "groupWait": "30s",
-    "groupInterval": "5m",
-    "repeatInterval": "12h",
-    "receiver": "wechat-example"
-  },
-  "receivers": [
-    {
-      "name": "wechat-example"
-    },
-    {
-      "name": "wechat-example"
-    }
-  ]
-}`,
+			name:                   "Test reject on duplicate receiver",
+			apiVersion:             "v1beta1",
+			golden:                 "Test_reject_on_duplicate_receiver_v1beta1.golden",
 			expectAdmissionAllowed: false,
 		},
 		{
-			name:       "Test reject on invalid receiver",
-			apiVersion: "v1alpha1",
-			spec: `{
-  "route": {
-    "groupBy": [
-      "job"
-    ],
-    "groupWait": "30s",
-    "groupInterval": "5m",
-    "repeatInterval": "12h",
-    "receiver": "wechat-example"
-  },
-  "receivers": [
-    {
-      "name": "wechat-example",
-      "wechatConfigs": [
-        {
-          "apiURL": "https://%<>wechatserver:8080/",
-          "corpID": "wechat-corpid",
-          "apiSecret": {
-            "name": "wechat-config",
-            "key": "apiSecret"
-          }
-        }
-      ]
-    }
-  ]
-}`,
+			name:                   "Test reject on invalid receiver",
+			apiVersion:             "v1alpha1",
+			golden:                 "Test_reject_on_invalid_receiver_v1alpha1.golden",
 			expectAdmissionAllowed: false,
 		},
 		{
-			name:       "Test reject on invalid receiver",
-			apiVersion: "v1beta1",
-			spec: `{
-  "route": {
-    "groupBy": [
-      "job"
-    ],
-    "groupWait": "30s",
-    "groupInterval": "5m",
-    "repeatInterval": "12h",
-    "receiver": "wechat-example"
-  },
-  "receivers": [
-    {
-      "name": "wechat-example",
-      "wechatConfigs": [
-        {
-          "apiURL": "https://%<>wechatserver:8080/",
-          "corpID": "wechat-corpid",
-          "apiSecret": {
-            "name": "wechat-config",
-            "key": "apiSecret"
-          }
-        }
-      ]
-    }
-  ]
-}`,
+			name:                   "Test reject on invalid receiver",
+			apiVersion:             "v1beta1",
+			golden:                 "Test_reject_on_invalid_receiver_v1beta1.golden",
 			expectAdmissionAllowed: false,
 		},
 		{
-			name:       "Test reject on invalid mute time intervals",
-			apiVersion: "v1alpha1",
-			spec: `{
-  "route": {
-    "groupBy": [
-      "job"
-    ],
-    "groupWait": "30s",
-    "groupInterval": "5m",
-    "repeatInterval": "12h",
-    "receiver": "wechat-example"
-  },
-  "receivers": [
-    {
-      "name": "wechat-example",
-      "wechatConfigs": [
-        {
-          "apiURL": "https://wechatserver:8080",
-          "corpID": "wechat-corpid",
-          "apiSecret": {
-            "name": "wechat-config",
-            "key": "apiSecret"
-          }
-        }
-      ]
-    }
-  ],
-  "muteTimeIntervals": [
-    {
-      "name": "out-of-business-hours",
-      "timeIntervals": [
-        {
-          "weekdays": [
-            "Xaturday",
-            "Sunday"
-          ]
-        },
-        {
-          "times": [
-            {
-              "startTime": "50:00",
-              "endTime": "08:00"
-            },
-            {
-              "startTime": "18:00",
-              "endTime": "24:00"
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}`,
+			name:                   "Test reject on invalid mute time intervals",
+			apiVersion:             "v1alpha1",
+			golden:                 "Test_reject_on_invalid_mute_time_intervals_v1alpha1.golden",
 			expectAdmissionAllowed: false,
 		},
 		{
-			name:       "Test reject on invalid time intervals",
-			apiVersion: "v1beta1",
-			spec: `{
-  "route": {
-    "groupBy": [
-      "job"
-    ],
-    "groupWait": "30s",
-    "groupInterval": "5m",
-    "repeatInterval": "12h",
-    "receiver": "wechat-example"
-  },
-  "receivers": [
-    {
-      "name": "wechat-example",
-      "wechatConfigs": [
-        {
-          "apiURL": "https://wechatserver:8080",
-          "corpID": "wechat-corpid",
-          "apiSecret": {
-            "name": "wechat-config",
-            "key": "apiSecret"
-          }
-        }
-      ]
-    }
-  ],
-  "timeIntervals": [
-    {
-      "name": "out-of-business-hours",
-      "timeIntervals": [
-        {
-          "weekdays": [
-            "Xaturday",
-            "Sunday"
-          ]
-        },
-        {
-          "times": [
-            {
-              "startTime": "50:00",
-              "endTime": "08:00"
-            },
-            {
-              "startTime": "18:00",
-              "endTime": "24:00"
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}`,
+			name:                   "Test reject on invalid time intervals",
+			apiVersion:             "v1beta1",
+			golden:                 "Test_reject_on_invalid_time_intervals_v1beta1.golden",
 			expectAdmissionAllowed: false,
 		},
 		{
-			name:       "Test happy path",
-			apiVersion: "v1alpha1",
-			spec: `{
-  "route": {
-    "groupBy": [
-      "job"
-    ],
-    "groupWait": "30s",
-    "groupInterval": "5m",
-    "repeatInterval": "12h",
-    "receiver": "wechat-example"
-  },
-  "receivers": [
-    {
-      "name": "wechat-example",
-      "wechatConfigs": [
-        {
-          "apiURL": "http://wechatserver:8080/",
-          "corpID": "wechat-corpid",
-          "apiSecret": {
-            "name": "wechat-config",
-            "key": "apiSecret"
-          }
-        }
-      ]
-    }
-  ],
-  "muteTimeIntervals": [
-    {
-      "name": "out-of-business-hours",
-      "timeIntervals": [
-        {
-          "weekdays": [
-            "Saturday",
-            "Sunday"
-          ]
-        },
-        {
-          "times": [
-            {
-              "startTime": "00:00",
-              "endTime": "08:00"
-            },
-            {
-              "startTime": "18:00",
-              "endTime": "24:00"
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}`,
+			name:                   "Test happy path",
+			apiVersion:             "v1alpha1",
+			golden:                 "Test_happy_path_v1alpha1.golden",
 			expectAdmissionAllowed: true,
 		},
 		{
-			name:       "Test happy path",
-			apiVersion: "v1beta1",
-			spec: `{
-  "route": {
-    "groupBy": [
-      "job"
-    ],
-    "groupWait": "30s",
-    "groupInterval": "5m",
-    "repeatInterval": "12h",
-    "receiver": "wechat-example"
-  },
-  "receivers": [
-    {
-      "name": "wechat-example",
-      "wechatConfigs": [
-        {
-          "apiURL": "http://wechatserver:8080/",
-          "corpID": "wechat-corpid",
-          "apiSecret": {
-            "name": "wechat-config",
-            "key": "apiSecret"
-          }
-        }
-      ]
-    }
-  ],
-  "timeIntervals": [
-    {
-      "name": "out-of-business-hours",
-      "timeIntervals": [
-        {
-          "weekdays": [
-            "Saturday",
-            "Sunday"
-          ]
-        },
-        {
-          "times": [
-            {
-              "startTime": "00:00",
-              "endTime": "08:00"
-            },
-            {
-              "startTime": "18:00",
-              "endTime": "24:00"
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}`,
+			name:                   "Test happy path",
+			apiVersion:             "v1beta1",
+			golden:                 "Test_happy_path_v1beta1.golden",
 			expectAdmissionAllowed: true,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name+","+tc.apiVersion, func(t *testing.T) {
-			resp := sendAdmissionReview(t, ts, buildAdmissionReviewFromAlertmanagerConfigSpec(t, tc.apiVersion, tc.spec))
+			resp := sendAdmissionReview(t, ts, buildAdmissionReviewFromAlertmanagerConfigSpec(t, tc.apiVersion, string(golden.Get(t, tc.golden)[:])))
 			if resp.Response.Allowed != tc.expectAdmissionAllowed {
 				t.Errorf(
 					"Unexpected admission result, wanted %v but got %v - (warnings=%v) - (details=%v)",
@@ -527,69 +238,18 @@ func TestAlertmanagerConfigConversion(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	for _, tc := range []struct {
-		name string
-		from string
-		to   string
-		spec string
+		name   string
+		from   string
+		to     string
+		golden string
 
 		checkFn func(converted []byte) error
 	}{
 		{
-			name: "happy path",
-			from: "v1alpha1",
-			to:   "v1beta1",
-			spec: `{
-  "route": {
-    "groupBy": [
-      "job"
-    ],
-    "groupWait": "30s",
-    "groupInterval": "5m",
-    "repeatInterval": "12h",
-    "receiver": "wechat-example"
-  },
-  "receivers": [
-    {
-      "name": "wechat-example",
-      "wechatConfigs": [
-        {
-          "apiURL": "http://wechatserver:8080/",
-          "corpID": "wechat-corpid",
-          "apiSecret": {
-            "name": "wechat-config",
-            "key": "apiSecret"
-          }
-        }
-      ]
-    }
-  ],
-  "muteTimeIntervals": [
-    {
-      "name": "out-of-business-hours",
-      "timeIntervals": [
-        {
-          "weekdays": [
-            "Saturday",
-            "Sunday"
-          ]
-        },
-        {
-          "times": [
-            {
-              "startTime": "00:00",
-              "endTime": "08:00"
-            },
-            {
-              "startTime": "18:00",
-              "endTime": "24:00"
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}`,
-
+			name:   "happy path",
+			from:   "v1alpha1",
+			to:     "v1beta1",
+			golden: "happy_path_v1alpha1_v1beta1.golden",
 			checkFn: func(converted []byte) error {
 				o := v1beta1.AlertmanagerConfig{}
 
@@ -610,61 +270,10 @@ func TestAlertmanagerConfigConversion(t *testing.T) {
 			},
 		},
 		{
-			name: "happy path",
-			from: "v1beta1",
-			to:   "v1alpha1",
-			spec: `{
-  "route": {
-    "groupBy": [
-      "job"
-    ],
-    "groupWait": "30s",
-    "groupInterval": "5m",
-    "repeatInterval": "12h",
-    "receiver": "wechat-example"
-  },
-  "receivers": [
-    {
-      "name": "wechat-example",
-      "wechatConfigs": [
-        {
-          "apiURL": "http://wechatserver:8080/",
-          "corpID": "wechat-corpid",
-          "apiSecret": {
-            "name": "wechat-config",
-            "key": "apiSecret"
-          }
-        }
-      ]
-    }
-  ],
-  "timeIntervals": [
-    {
-      "name": "out-of-business-hours",
-      "timeIntervals": [
-        {
-          "weekdays": [
-            "Saturday",
-            "Sunday"
-          ]
-        },
-        {
-          "times": [
-            {
-              "startTime": "00:00",
-              "endTime": "08:00"
-            },
-            {
-              "startTime": "18:00",
-              "endTime": "24:00"
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}`,
-
+			name:   "happy path",
+			from:   "v1beta1",
+			to:     "v1alpha1",
+			golden: "happy_path_v1beta1_v1alpha1.golden",
 			checkFn: func(converted []byte) error {
 				o := v1alpha1.AlertmanagerConfig{}
 
@@ -686,54 +295,40 @@ func TestAlertmanagerConfigConversion(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name+","+tc.from+">"+tc.to, func(t *testing.T) {
-			resp := sendConversionReview(t, ts, buildConversionReviewFromAlertmanagerConfigSpec(t, tc.from, tc.to, tc.spec))
-			if resp.Response.Result.Status != "Success" {
-				t.Fatalf(
-					"Unexpected conversion result, wanted 'Success' but got %v - (result=%v)",
-					resp.Response.Result.Status,
-					resp.Response.Result)
-			}
+			resp := sendConversionReview(t, ts, buildConversionReviewFromAlertmanagerConfigSpec(t, tc.from, tc.to, string(golden.Get(t, tc.golden)[:])))
+			require.Equal(t, "Success", resp.Response.Result.Status, "Unexpected conversion result, wanted 'Success' but got %v - (result=%v)",
+				resp.Response.Result.Status,
+				resp.Response.Result)
 
-			if len(resp.Response.ConvertedObjects) != 1 {
-				t.Fatalf("expected 1 converted object, got %d", len(resp.Response.ConvertedObjects))
-			}
+			require.Len(t, resp.Response.ConvertedObjects, 1, "expected 1 converted object, got %d", len(resp.Response.ConvertedObjects))
 
 			if tc.checkFn == nil {
 				return
 			}
 
 			err := tc.checkFn(resp.Response.ConvertedObjects[0].Raw)
-			if err != nil {
-				t.Fatalf("unexpected error while checking converted object: %v", err)
-			}
+			require.NoError(t, err)
 		})
 	}
 }
 
+// api returns an Admission instance with legacy validation for backward compatibility.
 func api() *Admission {
-	validationTriggered := prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_operator_rule_validation_triggered_total",
-		Help: "Number of times a prometheusRule object triggered validation",
-	})
+	return apiWithValidationScheme(model.LegacyValidation)
+}
 
-	validationErrors := prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_operator_rule_validation_errors_total",
-		Help: "Number of errors that occurred while validating a prometheusRules object",
-	})
-	alertManagerConfigValidationTriggered := prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_operator_alertmanager_config_validation_triggered_total",
-		Help: "Number of times an alertmanagerconfig object triggered validation",
-	})
+// apiWithUTF8Validation returns an Admission instance configured for UTF-8 validation.
+func apiWithUTF8Validation() *Admission {
+	return apiWithValidationScheme(model.UTF8Validation)
+}
 
-	alertManagerConfigValidationError := prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_operator_alertmanager_config_validation_errors_total",
-		Help: "Number of errors that occurred while validating a alertmanagerconfig object",
-	})
-
-	a := New(level.NewFilter(log.NewLogfmtLogger(log.NewSyncWriter(os.Stdout)), level.AllowNone()))
-	a.RegisterMetrics(validationTriggered, validationErrors, alertManagerConfigValidationTriggered, alertManagerConfigValidationError)
-
-	return a
+// apiWithValidationScheme returns an Admission instance with the specified validation scheme.
+func apiWithValidationScheme(validationScheme model.ValidationScheme) *Admission {
+	return New(
+		slog.New(slog.DiscardHandler),
+		validationScheme,
+		parser.Options{},
+	)
 }
 
 func server(h http.HandlerFunc) *httptest.Server {
@@ -742,19 +337,13 @@ func server(h http.HandlerFunc) *httptest.Server {
 
 func sendAdmissionReview(t *testing.T, ts *httptest.Server, b []byte) *v1.AdmissionReview {
 	resp, err := http.Post(ts.URL, "application/json", bytes.NewReader(b))
-	if err != nil {
-		t.Fatalf("POST request returned an error: %s", err)
-	}
+	require.NoError(t, err)
 
 	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("io.ReadAll(resp.Body) returned an error: %s", err)
-	}
+	require.NoError(t, err)
 
 	rev := &v1.AdmissionReview{}
-	if err := json.Unmarshal(body, rev); err != nil {
-		t.Fatalf("unable to parse webhook response: %s", err)
-	}
+	require.NoError(t, json.Unmarshal(body, rev))
 
 	return rev
 }
@@ -762,357 +351,16 @@ func sendAdmissionReview(t *testing.T, ts *httptest.Server, b []byte) *v1.Admiss
 func sendConversionReview(t *testing.T, ts *httptest.Server, b []byte) *apiextensionsv1.ConversionReview {
 	t.Helper()
 	resp, err := http.Post(ts.URL, "application/json", bytes.NewReader(b))
-	if err != nil {
-		t.Fatalf("POST request returned an error: %s", err)
-	}
+	require.NoError(t, err)
 
 	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("io.ReadAll(resp.Body) returned an error: %s", err)
-	}
+	require.NoError(t, err)
 
 	rev := &apiextensionsv1.ConversionReview{}
-	if err := json.Unmarshal(body, rev); err != nil {
-		t.Fatalf("unable to parse webhook response: %s (%q)", err, string(body))
-	}
+	require.NoError(t, json.Unmarshal(body, rev))
 
 	return rev
 }
-
-var goodRulesWithAnnotations = []byte(`
-{
-  "kind": "AdmissionReview",
-  "apiVersion": "admission.k8s.io/v1",
-  "request": {
-    "uid": "87c5df7f-5090-11e9-b9b4-02425473f309",
-    "kind": {
-      "group": "monitoring.coreos.com",
-      "version": "v1",
-      "kind": "PrometheusRule"
-    },
-    "resource": {
-      "group": "monitoring.coreos.com",
-      "version": "v1",
-      "resource": "prometheusrules"
-    },
-    "namespace": "monitoring",
-    "operation": "CREATE",
-    "userInfo": {
-      "username": "kubernetes-admin",
-      "groups": [
-        "system:masters",
-        "system:authenticated"
-      ]
-    },
-    "object": {
-      "apiVersion": "monitoring.coreos.com/v1",
-      "kind": "PrometheusRule",
-      "metadata": {
-        "annotations": {
-          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"monitoring.coreos.com/v1\",\"kind\":\"PrometheusRule\",\"metadata\":{\"annotations\":{},\"name\":\"test\",\"namespace\":\"monitoring\"},\"spec\":{\"groups\":[{\"name\":\"test.rules\",\"rules\":[{\"alert\":\"Test\",\"annotations\":{\"message\":\"Test rule\"},\"expr\":\"vector(1))\",\"for\":\"5m\",\"labels\":{\"severity\":\"critical\"}}]}]}}\n"
-        },
-        "creationTimestamp": "2019-03-27T13:02:09Z",
-        "generation": 1,
-        "name": "test",
-        "namespace": "monitoring",
-        "uid": "87c5d31d-5090-11e9-b9b4-02425473f309"
-      },
-      "spec": {
-        "groups": [
-          {
-            "name": "test.rules",
-            "partial_response_strategy": "abort",
-            "rules": [
-              {
-                "alert": "Test",
-                "annotations": {
-                  "message": "Test rule",
-                  "humanizePercentage": "Should work {{ $value | humanizePercentage }}"
-                },
-                "expr": "vector(1)",
-                "for": "5m",
-                "labels": {
-                  "severity": "critical"
-                }
-              }
-            ]
-          }
-        ]
-      }
-    },
-    "oldObject": null,
-    "dryRun": false
-  }
-}
-`)
-
-var goodRulesWithExternalLabelsInAnnotations = []byte(`
-{
-  "kind": "AdmissionReview",
-  "apiVersion": "admission.k8s.io/v1",
-  "request": {
-    "uid": "87c5df7f-5090-11e9-b9b4-02425473f309",
-    "kind": {
-      "group": "monitoring.coreos.com",
-      "version": "v1",
-      "kind": "PrometheusRule"
-    },
-    "resource": {
-      "group": "monitoring.coreos.com",
-      "version": "v1",
-      "resource": "prometheusrules"
-    },
-    "namespace": "monitoring",
-    "operation": "CREATE",
-    "userInfo": {
-      "username": "kubernetes-admin",
-      "groups": [
-        "system:masters",
-        "system:authenticated"
-      ]
-    },
-    "object": {
-      "apiVersion": "monitoring.coreos.com/v1",
-      "kind": "PrometheusRule",
-      "metadata": {
-        "annotations": {
-          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"monitoring.coreos.com/v1\",\"kind\":\"PrometheusRule\",\"metadata\":{\"annotations\":{},\"name\":\"test\",\"namespace\":\"monitoring\"},\"spec\":{\"groups\":[{\"name\":\"test.rules\",\"rules\":[{\"alert\":\"Test\",\"annotations\":{\"message\":\"Test rule\"},\"expr\":\"vector(1))\",\"for\":\"5m\",\"labels\":{\"severity\":\"critical\"}}]}]}}\n"
-        },
-        "creationTimestamp": "2019-03-27T13:02:09Z",
-        "generation": 1,
-        "name": "test",
-        "namespace": "monitoring",
-        "uid": "87c5d31d-5090-11e9-b9b4-02425473f309"
-      },
-      "spec": {
-        "groups": [
-          {
-            "name": "test.rules",
-            "rules": [
-              {
-                "alert": "Test",
-                "annotations": {
-                  "message": "Test externalLabels {{ $externalLabels.cluster }}"
-                },
-                "expr": "vector(1)",
-                "for": "5m",
-                "labels": {
-                  "severity": "critical"
-                }
-              }
-            ]
-          }
-        ]
-      }
-    },
-    "oldObject": null,
-    "dryRun": false
-  }
-}
-`)
-
-var badRulesNoAnnotations = []byte(`
-{
-  "kind": "AdmissionReview",
-  "apiVersion": "admission.k8s.io/v1",
-  "request": {
-    "uid": "87c5df7f-5090-11e9-b9b4-02425473f309",
-    "kind": {
-      "group": "monitoring.coreos.com",
-      "version": "v1",
-      "kind": "PrometheusRule"
-    },
-    "resource": {
-      "group": "monitoring.coreos.com",
-      "version": "v1",
-      "resource": "prometheusrules"
-    },
-    "namespace": "monitoring",
-    "operation": "CREATE",
-    "userInfo": {
-      "username": "kubernetes-admin",
-      "groups": [
-        "system:masters",
-        "system:authenticated"
-      ]
-    },
-    "object": {
-      "apiVersion": "monitoring.coreos.com/v1",
-      "kind": "PrometheusRule",
-      "metadata": {
-        "creationTimestamp": "2019-03-27T13:02:09Z",
-        "generation": 1,
-        "name": "test",
-        "namespace": "monitoring",
-        "uid": "87c5d31d-5090-11e9-b9b4-02425473f309"
-      },
-      "spec": {
-        "groups": [
-          {
-            "name": "test.rules",
-            "rules": [
-              {
-                "alert": "Test",
-                "annotations": {
-                  "message": "Test rule",
-                  "val": "{{ print “%f“ $value }}"
-                },
-                "expr": "vector(1))",
-                "for": "5m",
-                "labels": {
-                  "severity": "critical"
-                }
-              }
-            ]
-          }
-        ]
-      }
-    },
-    "oldObject": null,
-    "dryRun": false
-  }
-}
-`)
-
-var badRulesWithBooleanInAnnotations = []byte(`
-{
-  "kind": "AdmissionReview",
-  "apiVersion": "admission.k8s.io/v1",
-  "request": {
-    "uid": "87c5df7f-5090-11e9-b9b4-02425473f309",
-    "kind": {
-      "group": "monitoring.coreos.com",
-      "version": "v1",
-      "kind": "PrometheusRule"
-    },
-    "resource": {
-      "group": "monitoring.coreos.com",
-      "version": "v1",
-      "resource": "prometheusrules"
-    },
-    "namespace": "monitoring",
-    "operation": "CREATE",
-    "userInfo": {
-      "username": "kubernetes-admin",
-      "groups": [
-        "system:masters",
-        "system:authenticated"
-      ]
-    },
-    "object": {
-      "apiVersion": "monitoring.coreos.com/v1",
-      "kind": "PrometheusRule",
-      "metadata": {
-        "annotations": {
-          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"monitoring.coreos.com/v1\",\"kind\":\"PrometheusRule\",\"metadata\":{\"annotations\":{},\"name\":\"test\",\"namespace\":\"monitoring\"},\"spec\":{\"groups\":[{\"name\":\"test.rules\",\"rules\":[{\"alert\":\"Test\",\"annotations\":{\"message\":\"Test rule\"},\"expr\":\"vector(1))\",\"for\":\"5m\",\"labels\":{\"severity\":\"critical\"}}]}]}}\n"
-        },
-        "creationTimestamp": "2019-03-27T13:02:09Z",
-        "generation": 1,
-        "name": "test",
-        "namespace": "monitoring",
-        "uid": "87c5d31d-5090-11e9-b9b4-02425473f309"
-      },
-      "spec": {
-        "groups": [
-          {
-            "name": "test.rules",
-            "rules": [
-              {
-                "alert": "Test",
-                "annotations": {
-                  "badBoolean": false,
-                  "message": "Test rule",
-                  "humanizePercentage": "Should work {{ $value | humanizePercentage }}"
-                },
-                "expr": "vector(1)",
-                "for": "5m",
-                "labels": {
-                  "severity": "critical"
-                }
-              }
-            ]
-          }
-        ]
-      }
-    },
-    "oldObject": null,
-    "dryRun": false
-  }
-}
-`)
-
-var nonStringsInLabelsAnnotations = []byte(`
-{
-  "kind": "AdmissionReview",
-  "apiVersion": "admission.k8s.io/v1",
-  "request": {
-    "uid": "87c5df7f-5090-11e9-b9b4-02425473f309",
-    "kind": {
-      "group": "monitoring.coreos.com",
-      "version": "v1",
-      "kind": "PrometheusRule"
-    },
-    "resource": {
-      "group": "monitoring.coreos.com",
-      "version": "v1",
-      "resource": "prometheusrules"
-    },
-    "namespace": "monitoring",
-    "operation": "CREATE",
-    "userInfo": {
-      "username": "kubernetes-admin",
-      "groups": [
-        "system:masters",
-        "system:authenticated"
-      ]
-    },
-    "object": {
-      "apiVersion": "monitoring.coreos.com/v1",
-      "kind": "PrometheusRule",
-      "metadata": {
-        "annotations": {
-          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"monitoring.coreos.com/v1\",\"kind\":\"PrometheusRule\",\"metadata\":{\"annotations\":{},\"name\":\"test\",\"namespace\":\"monitoring\"},\"spec\":{\"groups\":[{\"name\":\"test.rules\",\"rules\":[{\"alert\":\"Test\",\"annotations\":{\"message\":\"Test rule\"},\"expr\":\"vector(1))\",\"for\":\"5m\",\"labels\":{\"severity\":\"critical\"}}]}]}}\n"
-        },
-        "creationTimestamp": "2019-03-27T13:02:09Z",
-        "generation": 1,
-        "name": "test",
-        "namespace": "monitoring",
-        "uid": "87c5d31d-5090-11e9-b9b4-02425473f309"
-      },
-      "spec": {
-        "groups": [
-          {
-            "name": "test.rules",
-            "rules": [
-              {
-                "alert": "Test",
-                "annotations": {
-                  "annBool": false,
-                  "message": "Test rule",
-                  "annNil": null,
-                  "humanizePercentage": "Should work {{ $value | humanizePercentage }}",
-                  "annEmpty": "",
-                  "annInteger": 1
-                },
-                "expr": "vector(1)",
-                "for": "5m",
-                "labels": {
-                  "severity": "critical",
-                  "labNil": null,
-                  "labInt": 1,
-                  "labEmpty": "",
-                  "labBool": true
-                }
-              }
-            ]
-          }
-        ]
-      }
-    },
-    "oldObject": null,
-    "dryRun": false
-  }
-}`)
 
 func buildAdmissionReviewFromAlertmanagerConfigSpec(t *testing.T, version, spec string) []byte {
 	t.Helper()
@@ -1198,4 +446,88 @@ func buildConversionReviewFromAlertmanagerConfigSpec(t *testing.T, from, to, spe
 		alertManagerConfigKind,
 		spec)
 	return []byte(tmpl)
+}
+
+func TestAdmitGoodRuleWithUTF8Validation(t *testing.T) {
+	ts := server(apiWithUTF8Validation().servePrometheusRulesValidate)
+	defer ts.Close()
+
+	resp := sendAdmissionReview(t, ts, golden.Get(t, "goodRulesWithUTF8.golden"))
+	if !resp.Response.Allowed {
+		t.Errorf("Expected admission to be allowed with UTF-8 validation")
+	}
+}
+
+func TestAdmitUTF8RuleWithLegacyValidation(t *testing.T) {
+	// This test verifies that UTF-8 rules are rejected with legacy validation
+	ts := server(api().servePrometheusRulesValidate) // Uses legacy validation
+	defer ts.Close()
+
+	resp := sendAdmissionReview(t, ts, golden.Get(t, "goodRulesWithUTF8.golden"))
+	if resp.Response.Allowed {
+		t.Errorf("Expected admission to be rejected with legacy validation for UTF-8 characters")
+	}
+
+	// Verify that it's rejected for the right reason (validation error)
+	if resp.Response.Result == nil || resp.Response.Result.Message == "" {
+		t.Errorf("Expected validation error message, got empty result")
+	}
+}
+
+func TestValidationSchemeComparison(t *testing.T) {
+	tests := []struct {
+		name        string
+		admit       *Admission
+		goldenFile  string
+		shouldAllow bool
+		description string
+	}{
+		{
+			name:        "legacy_validation_with_ascii_rules",
+			admit:       api(),
+			goldenFile:  "goodRulesWithAnnotations.golden",
+			shouldAllow: true,
+			description: "ASCII rules should pass with legacy validation",
+		},
+		{
+			name:        "utf8_validation_with_ascii_rules",
+			admit:       apiWithUTF8Validation(),
+			goldenFile:  "goodRulesWithAnnotations.golden",
+			shouldAllow: true,
+			description: "ASCII rules should pass with UTF-8 validation",
+		},
+		{
+			name:        "legacy_validation_with_utf8_rules",
+			admit:       api(),
+			goldenFile:  "goodRulesWithUTF8.golden",
+			shouldAllow: false,
+			description: "UTF-8 rules should be rejected with legacy validation",
+		},
+		{
+			name:        "utf8_validation_with_utf8_rules",
+			admit:       apiWithUTF8Validation(),
+			goldenFile:  "goodRulesWithUTF8.golden",
+			shouldAllow: true,
+			description: "UTF-8 rules should pass with UTF-8 validation",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := server(tt.admit.servePrometheusRulesValidate)
+			defer ts.Close()
+
+			resp := sendAdmissionReview(t, ts, golden.Get(t, tt.goldenFile))
+
+			if tt.shouldAllow && !resp.Response.Allowed {
+				t.Errorf("%s: Expected admission to be allowed, but it was rejected. Message: %s",
+					tt.description,
+					resp.Response.Result.Message)
+			}
+
+			if !tt.shouldAllow && resp.Response.Allowed {
+				t.Errorf("%s: Expected admission to be rejected, but it was allowed", tt.description)
+			}
+		})
+	}
 }

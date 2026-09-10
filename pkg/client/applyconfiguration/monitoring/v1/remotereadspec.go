@@ -17,29 +17,77 @@
 package v1
 
 import (
-	v1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	corev1 "k8s.io/api/core/v1"
 )
 
-// RemoteReadSpecApplyConfiguration represents an declarative configuration of the RemoteReadSpec type for use
+// RemoteReadSpecApplyConfiguration represents a declarative configuration of the RemoteReadSpec type for use
 // with apply.
+//
+// RemoteReadSpec defines the configuration for Prometheus to read back samples
+// from a remote endpoint.
 type RemoteReadSpecApplyConfiguration struct {
-	URL                  *string                          `json:"url,omitempty"`
-	Name                 *string                          `json:"name,omitempty"`
-	RequiredMatchers     map[string]string                `json:"requiredMatchers,omitempty"`
-	RemoteTimeout        *v1.Duration                     `json:"remoteTimeout,omitempty"`
-	Headers              map[string]string                `json:"headers,omitempty"`
-	ReadRecent           *bool                            `json:"readRecent,omitempty"`
-	BasicAuth            *BasicAuthApplyConfiguration     `json:"basicAuth,omitempty"`
-	OAuth2               *OAuth2ApplyConfiguration        `json:"oauth2,omitempty"`
-	BearerToken          *string                          `json:"bearerToken,omitempty"`
-	BearerTokenFile      *string                          `json:"bearerTokenFile,omitempty"`
-	Authorization        *AuthorizationApplyConfiguration `json:"authorization,omitempty"`
-	TLSConfig            *TLSConfigApplyConfiguration     `json:"tlsConfig,omitempty"`
-	ProxyURL             *string                          `json:"proxyUrl,omitempty"`
-	FilterExternalLabels *bool                            `json:"filterExternalLabels,omitempty"`
+	// url defines the URL of the endpoint to query from.
+	//
+	// It must use the HTTP or HTTPS scheme.
+	URL *monitoringv1.URL `json:"url,omitempty"`
+	// name of the remote read queue, it must be unique if specified. The
+	// name is used in metrics and logging in order to differentiate read
+	// configurations.
+	//
+	// It requires Prometheus >= v2.15.0.
+	Name *string `json:"name,omitempty"`
+	// requiredMatchers defines an optional list of equality matchers which have to be present
+	// in a selector to query the remote read endpoint.
+	RequiredMatchers map[string]string `json:"requiredMatchers,omitempty"`
+	// remoteTimeout defines the timeout for requests to the remote read endpoint.
+	RemoteTimeout *monitoringv1.Duration `json:"remoteTimeout,omitempty"`
+	// headers defines the custom HTTP headers to be sent along with each remote read request.
+	// Be aware that headers that are set by Prometheus itself can't be overwritten.
+	// Only valid in Prometheus versions 2.26.0 and newer.
+	Headers map[string]string `json:"headers,omitempty"`
+	// readRecent defines whether reads should be made for queries for time ranges that
+	// the local storage should have complete data for.
+	ReadRecent *bool `json:"readRecent,omitempty"`
+	// oauth2 configuration for the URL.
+	//
+	// It requires Prometheus >= v2.27.0.
+	//
+	// Cannot be set at the same time as `authorization`, or `basicAuth`.
+	OAuth2 *OAuth2ApplyConfiguration `json:"oauth2,omitempty"`
+	// basicAuth configuration for the URL.
+	//
+	// Cannot be set at the same time as `authorization`, or `oauth2`.
+	BasicAuth *BasicAuthApplyConfiguration `json:"basicAuth,omitempty"`
+	// bearerTokenFile defines the file from which to read the bearer token for the URL.
+	//
+	// Deprecated: this will be removed in a future release. Prefer using `authorization`.
+	BearerTokenFile *string `json:"bearerTokenFile,omitempty"`
+	// authorization section for the URL.
+	//
+	// It requires Prometheus >= v2.26.0.
+	//
+	// Cannot be set at the same time as `basicAuth`, or `oauth2`.
+	Authorization *AuthorizationApplyConfiguration `json:"authorization,omitempty"`
+	// bearerToken is deprecated: this will be removed in a future release.
+	// *Warning: this field shouldn't be used because the token value appears
+	// in clear-text. Prefer using `authorization`.*
+	BearerToken *string `json:"bearerToken,omitempty"`
+	// tlsConfig to use for the URL.
+	TLSConfig *TLSConfigApplyConfiguration `json:"tlsConfig,omitempty"`
+	// Optional ProxyConfig.
+	ProxyConfigApplyConfiguration `json:""`
+	// followRedirects defines whether HTTP requests follow HTTP 3xx redirects.
+	//
+	// It requires Prometheus >= v2.26.0.
+	FollowRedirects *bool `json:"followRedirects,omitempty"`
+	// filterExternalLabels defines whether to use the external labels as selectors for the remote read endpoint.
+	//
+	// It requires Prometheus >= v2.34.0.
+	FilterExternalLabels *bool `json:"filterExternalLabels,omitempty"`
 }
 
-// RemoteReadSpecApplyConfiguration constructs an declarative configuration of the RemoteReadSpec type for use with
+// RemoteReadSpecApplyConfiguration constructs a declarative configuration of the RemoteReadSpec type for use with
 // apply.
 func RemoteReadSpec() *RemoteReadSpecApplyConfiguration {
 	return &RemoteReadSpecApplyConfiguration{}
@@ -48,7 +96,7 @@ func RemoteReadSpec() *RemoteReadSpecApplyConfiguration {
 // WithURL sets the URL field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the URL field is set to the value of the last call.
-func (b *RemoteReadSpecApplyConfiguration) WithURL(value string) *RemoteReadSpecApplyConfiguration {
+func (b *RemoteReadSpecApplyConfiguration) WithURL(value monitoringv1.URL) *RemoteReadSpecApplyConfiguration {
 	b.URL = &value
 	return b
 }
@@ -78,7 +126,7 @@ func (b *RemoteReadSpecApplyConfiguration) WithRequiredMatchers(entries map[stri
 // WithRemoteTimeout sets the RemoteTimeout field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the RemoteTimeout field is set to the value of the last call.
-func (b *RemoteReadSpecApplyConfiguration) WithRemoteTimeout(value v1.Duration) *RemoteReadSpecApplyConfiguration {
+func (b *RemoteReadSpecApplyConfiguration) WithRemoteTimeout(value monitoringv1.Duration) *RemoteReadSpecApplyConfiguration {
 	b.RemoteTimeout = &value
 	return b
 }
@@ -105,14 +153,6 @@ func (b *RemoteReadSpecApplyConfiguration) WithReadRecent(value bool) *RemoteRea
 	return b
 }
 
-// WithBasicAuth sets the BasicAuth field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the BasicAuth field is set to the value of the last call.
-func (b *RemoteReadSpecApplyConfiguration) WithBasicAuth(value *BasicAuthApplyConfiguration) *RemoteReadSpecApplyConfiguration {
-	b.BasicAuth = value
-	return b
-}
-
 // WithOAuth2 sets the OAuth2 field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the OAuth2 field is set to the value of the last call.
@@ -121,11 +161,11 @@ func (b *RemoteReadSpecApplyConfiguration) WithOAuth2(value *OAuth2ApplyConfigur
 	return b
 }
 
-// WithBearerToken sets the BearerToken field in the declarative configuration to the given value
+// WithBasicAuth sets the BasicAuth field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the BearerToken field is set to the value of the last call.
-func (b *RemoteReadSpecApplyConfiguration) WithBearerToken(value string) *RemoteReadSpecApplyConfiguration {
-	b.BearerToken = &value
+// If called multiple times, the BasicAuth field is set to the value of the last call.
+func (b *RemoteReadSpecApplyConfiguration) WithBasicAuth(value *BasicAuthApplyConfiguration) *RemoteReadSpecApplyConfiguration {
+	b.BasicAuth = value
 	return b
 }
 
@@ -145,6 +185,14 @@ func (b *RemoteReadSpecApplyConfiguration) WithAuthorization(value *Authorizatio
 	return b
 }
 
+// WithBearerToken sets the BearerToken field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the BearerToken field is set to the value of the last call.
+func (b *RemoteReadSpecApplyConfiguration) WithBearerToken(value string) *RemoteReadSpecApplyConfiguration {
+	b.BearerToken = &value
+	return b
+}
+
 // WithTLSConfig sets the TLSConfig field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the TLSConfig field is set to the value of the last call.
@@ -157,7 +205,45 @@ func (b *RemoteReadSpecApplyConfiguration) WithTLSConfig(value *TLSConfigApplyCo
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the ProxyURL field is set to the value of the last call.
 func (b *RemoteReadSpecApplyConfiguration) WithProxyURL(value string) *RemoteReadSpecApplyConfiguration {
-	b.ProxyURL = &value
+	b.ProxyConfigApplyConfiguration.ProxyURL = &value
+	return b
+}
+
+// WithNoProxy sets the NoProxy field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the NoProxy field is set to the value of the last call.
+func (b *RemoteReadSpecApplyConfiguration) WithNoProxy(value string) *RemoteReadSpecApplyConfiguration {
+	b.ProxyConfigApplyConfiguration.NoProxy = &value
+	return b
+}
+
+// WithProxyFromEnvironment sets the ProxyFromEnvironment field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the ProxyFromEnvironment field is set to the value of the last call.
+func (b *RemoteReadSpecApplyConfiguration) WithProxyFromEnvironment(value bool) *RemoteReadSpecApplyConfiguration {
+	b.ProxyConfigApplyConfiguration.ProxyFromEnvironment = &value
+	return b
+}
+
+// WithProxyConnectHeader puts the entries into the ProxyConnectHeader field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, the entries provided by each call will be put on the ProxyConnectHeader field,
+// overwriting an existing map entries in ProxyConnectHeader field with the same key.
+func (b *RemoteReadSpecApplyConfiguration) WithProxyConnectHeader(entries map[string][]corev1.SecretKeySelector) *RemoteReadSpecApplyConfiguration {
+	if b.ProxyConfigApplyConfiguration.ProxyConnectHeader == nil && len(entries) > 0 {
+		b.ProxyConfigApplyConfiguration.ProxyConnectHeader = make(map[string][]corev1.SecretKeySelector, len(entries))
+	}
+	for k, v := range entries {
+		b.ProxyConfigApplyConfiguration.ProxyConnectHeader[k] = v
+	}
+	return b
+}
+
+// WithFollowRedirects sets the FollowRedirects field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the FollowRedirects field is set to the value of the last call.
+func (b *RemoteReadSpecApplyConfiguration) WithFollowRedirects(value bool) *RemoteReadSpecApplyConfiguration {
+	b.FollowRedirects = &value
 	return b
 }
 

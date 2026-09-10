@@ -1,4 +1,4 @@
-// Copyright 2016 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,22 +16,35 @@ package listwatch
 
 import (
 	"context"
+	"crypto/rand"
+	"fmt"
+	"log/slog"
+	"math/big"
+	"slices"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
-	v1 "k8s.io/api/core/v1"
+	"github.com/blang/semver/v4"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/kubernetes/scheme"
+	typedauthv1 "k8s.io/client-go/kubernetes/typed/authorization/v1"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
+
+	sortutil "github.com/prometheus-operator/prometheus-operator/internal/sortutil"
+	"github.com/prometheus-operator/prometheus-operator/pkg/k8s"
 )
 
-// NewUnprivilegedNamespaceListWatchFromClient mimics
+const (
+	pollInterval = 15 * time.Second
+)
+
+// NewNamespaceListWatchFromClient mimics
 // cache.NewListWatchFromClient. It allows for the creation of a
 // cache.ListWatch for namespaces from a client that does not have `List`
 // privileges. If the slice of namespaces contains only v1.NamespaceAll, then
@@ -45,70 +58,119 @@ import (
 //
 // If the allowed namespaces includes exactly one entry with the value v1.NamespaceAll (empty string),
 // the given denied namespaces are applied.
-func NewUnprivilegedNamespaceListWatchFromClient(
+func NewNamespaceListWatchFromClient(
 	ctx context.Context,
-	l log.Logger,
-	c cache.Getter,
+	l *slog.Logger,
+	k8sVersion semver.Version,
+	corev1Client typedcorev1.CoreV1Interface,
+	ssarClient typedauthv1.SelfSubjectAccessReviewInterface,
 	allowedNamespaces, deniedNamespaces map[string]struct{},
-	fieldSelector fields.Selector,
-) cache.ListerWatcher {
+) (cache.ListerWatcher, bool, error) {
 	if l == nil {
-		l = log.NewNopLogger()
+		l = slog.New(slog.DiscardHandler)
 	}
 
-	optionsModifier := func(options *metav1.ListOptions) {
-		options.FieldSelector = fieldSelector.String()
+	listWatchAllowed, reasons, err := k8s.IsAllowed(
+		ctx,
+		ssarClient,
+		nil, // namespaces is a cluster-scoped resource.
+		k8s.ResourceAttribute{
+			Resource: "namespaces",
+			Verbs:    []string{"list", "watch"},
+		},
+	)
+	if err != nil {
+		return nil, false, err
 	}
 
-	// If the only namespace given is `v1.NamespaceAll`, then this
-	// cache.ListWatch must be privileged. In this case, return a regular
-	// cache.ListWatch tweaked with denylist fieldselector
-	// filtering the given denied namespaces.
+	// The "kubernetes.io/metadata.name" label is GA since Kubernetes 1.22.
+	metadataNameLabelSupported := k8sVersion.GTE(semver.MustParse("1.22.0"))
+
 	if IsAllNamespaces(allowedNamespaces) {
-		tweak := func(options *metav1.ListOptions) {
-			optionsModifier(options)
+		if !listWatchAllowed {
+			err := fmt.Errorf("missing list/watch permissions on the 'namespaces' resource")
+			for _, r := range reasons {
+				err = fmt.Errorf("%w: %w", err, r)
+			}
 
+			return nil, false, err
+		}
+
+		// deniedNamespaces is only supported with allowedNamespaces = "all".
+		tweak := func(options *metav1.ListOptions) {
 			DenyTweak(options, "metadata.name", deniedNamespaces)
 		}
-
-		return cache.NewFilteredListWatchFromClient(c, "namespaces", metav1.NamespaceAll, tweak)
-	}
-
-	listFunc := func(options metav1.ListOptions) (runtime.Object, error) {
-		optionsModifier(&options)
-		list := &v1.NamespaceList{}
-		for name := range allowedNamespaces {
-			result := &v1.Namespace{}
-			err := c.Get().
-				Resource("namespaces").
-				Name(name).
-				VersionedParams(&options, scheme.ParameterCodec).
-				Do(ctx).
-				Into(result)
-			if apierrors.IsNotFound(err) {
-				level.Info(l).Log("msg", "namespace not found", "namespace", name)
-				continue
+		if metadataNameLabelSupported {
+			// Using a label selector is more efficient but requires Kubernetes 1.22 at least.
+			tweak = func(options *metav1.ListOptions) {
+				TweakByLabel(options, "kubernetes.io/metadata.name", ExcludeFilterType, deniedNamespaces)
 			}
-			if err != nil {
-				return nil, errors.Wrap(err, "unexpected error while listing namespaces")
-			}
-			list.Items = append(list.Items, *result)
 		}
-		return list, nil
+
+		return cache.NewFilteredListWatchFromClient(
+			corev1Client.RESTClient(),
+			"namespaces",
+			metav1.NamespaceAll,
+			tweak,
+		), true, nil
 	}
-	watchFunc := func(_ metav1.ListOptions) (watch.Interface, error) {
-		// Since the client does not have Watch privileges, do not
-		// actually watch anything. Use a watch.FakeWatcher here to
-		// implement watch.Interface but not send any events.
-		return watch.NewFake(), nil
+
+	if listWatchAllowed && metadataNameLabelSupported {
+		l.Debug("using privileged namespace lister/watcher")
+		return cache.NewFilteredListWatchFromClient(
+			corev1Client.RESTClient(),
+			"namespaces",
+			metav1.NamespaceAll,
+			func(options *metav1.ListOptions) {
+				TweakByLabel(options, "kubernetes.io/metadata.name", IncludeFilterType, allowedNamespaces)
+			},
+		), true, nil
 	}
-	return &cache.ListWatch{ListFunc: listFunc, WatchFunc: watchFunc}
+
+	// At this point, the operator has no list/watch permissions on the
+	// namespaces resource. Check if it has at least the get permission to
+	// emulate the list/watch operations.
+	attrs := make([]k8s.ResourceAttribute, 0, len(allowedNamespaces))
+	for n := range allowedNamespaces {
+		attrs = append(attrs, k8s.ResourceAttribute{
+			Verbs:    []string{"get"},
+			Resource: "namespaces",
+			Name:     n,
+		})
+	}
+
+	getAllowed, reasons, err := k8s.IsAllowed(
+		ctx,
+		ssarClient,
+		nil, // namespaces is a cluster-scoped resource.
+		attrs...,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Only log a warning to preserve backward compatibility.
+	if !getAllowed {
+		err := fmt.Errorf("missing permissions")
+		for _, r := range reasons {
+			err = fmt.Errorf("%w: %w", err, r)
+		}
+
+		l.Warn("the operator lacks required permissions which may result in degraded functionalities", "err", err)
+	}
+
+	var namespaces []string
+	for ns := range allowedNamespaces {
+		namespaces = append(namespaces, ns)
+	}
+
+	return newPollBasedListerWatcher(ctx, l, corev1Client, namespaces), false, nil
 }
 
 // IsAllNamespaces checks if the given map of namespaces
 // contains only v1.NamespaceAll.
 func IsAllNamespaces(namespaces map[string]struct{}) bool {
-	_, ok := namespaces[v1.NamespaceAll]
+	_, ok := namespaces[corev1.NamespaceAll]
 	return ok && len(namespaces) == 1
 }
 
@@ -127,22 +189,263 @@ func IdenticalNamespaces(a, b map[string]struct{}) bool {
 	return true
 }
 
-// DenyTweak modifies the given list options
-// by adding a field selector not matching the given values.
+type FilterType string
+
+const (
+	IncludeFilterType = "Include"
+	ExcludeFilterType = "Exclude"
+)
+
+// TweakByLabel modifies the given list options by adding a label selector
+// matching/excluding the given values.
+func TweakByLabel(options *metav1.ListOptions, label string, filter FilterType, valueSet map[string]struct{}) {
+	if len(valueSet) == 0 {
+		return
+	}
+
+	var op string
+	switch filter {
+	case IncludeFilterType:
+		op = "in"
+	case ExcludeFilterType:
+		op = "notin"
+	default:
+		panic(fmt.Sprintf("unsupported filter: %q", filter))
+	}
+	selectors := []string{fmt.Sprintf("%s %s (%s)", label, op, strings.Join(sortutil.SortedKeys(valueSet), ","))}
+
+	if options.LabelSelector != "" {
+		selectors = append(selectors, options.LabelSelector)
+	}
+
+	options.LabelSelector = strings.Join(selectors, ",")
+}
+
+// DenyTweak modifies the given list options by adding a field selector *not*
+// matching the given values.
 func DenyTweak(options *metav1.ListOptions, field string, valueSet map[string]struct{}) {
 	if len(valueSet) == 0 {
 		return
 	}
 
 	var selectors []string
-
 	for value := range valueSet {
 		selectors = append(selectors, field+"!="+value)
 	}
+	slices.Sort(selectors)
 
 	if options.FieldSelector != "" {
 		selectors = append(selectors, options.FieldSelector)
 	}
 
 	options.FieldSelector = strings.Join(selectors, ",")
+}
+
+// pollBasedListerWatcher is a lister/watcher on a fixed list of namespaces.
+// It retrieves the namespaces from the Kubernetes API periodically and
+// notifies any addition/update/deletion to the client as a regular
+// lister/watcher would do.
+type pollBasedListerWatcher struct {
+	corev1Client typedcorev1.CoreV1Interface
+	ch           chan watch.Event
+
+	ctx context.Context
+	l   *slog.Logger
+
+	mtx        sync.Mutex
+	cancelPoll context.CancelFunc
+	pollWg     sync.WaitGroup
+
+	cache map[string]cacheEntry
+}
+
+type cacheEntry struct {
+	present bool
+	ns      *corev1.Namespace
+}
+
+var _ = watch.Interface(&pollBasedListerWatcher{})
+var _ = cache.ListerWatcher(&pollBasedListerWatcher{})
+
+func newPollBasedListerWatcher(ctx context.Context, l *slog.Logger, corev1Client typedcorev1.CoreV1Interface, namespaces []string) *pollBasedListerWatcher {
+	if l == nil {
+		l = slog.New(slog.DiscardHandler)
+	}
+
+	pblw := &pollBasedListerWatcher{
+		corev1Client: corev1Client,
+		ch:           make(chan watch.Event, 1),
+		ctx:          ctx,
+		l:            l,
+		cache:        make(map[string]cacheEntry, len(namespaces)),
+	}
+
+	for _, ns := range namespaces {
+		pblw.cache[ns] = cacheEntry{}
+	}
+
+	return pblw
+}
+
+func (pblw *pollBasedListerWatcher) List(_ metav1.ListOptions) (runtime.Object, error) {
+	list := &corev1.NamespaceList{}
+
+	for ns := range pblw.cache {
+		result, err := pblw.corev1Client.Namespaces().Get(pblw.ctx, ns, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				pblw.l.Info("namespace not found", "namespace", ns)
+				continue
+			}
+
+			return nil, fmt.Errorf("unexpected error while listing namespaces: %w", err)
+		}
+
+		pblw.cache[ns] = cacheEntry{
+			present: true,
+			ns:      result,
+		}
+		list.Items = append(list.Items, *result)
+	}
+
+	return list, nil
+}
+
+// k8s.io/client-go >= v0.35 uses the streaming approach for WatchList by default.
+// It requires the ListerWatcher to send ADDED events for all known
+// namespaces first followed by a BOOKMARK event telling the client that
+// the initial events have all been emitted.
+// A "simple" way to revert back to the legacy behavior with the client calling
+// List() first and then Watch() is to implement a
+// IsWatchListSemanticsUnSupported() function returning true.
+func (pblw *pollBasedListerWatcher) IsWatchListSemanticsUnSupported() bool { return true }
+
+func (pblw *pollBasedListerWatcher) Watch(_ metav1.ListOptions) (watch.Interface, error) {
+	return pblw, nil
+}
+
+func (pblw *pollBasedListerWatcher) Stop() {
+	pblw.mtx.Lock()
+	if pblw.cancelPoll != nil {
+		pblw.cancelPoll()
+		pblw.cancelPoll = nil
+	}
+	pblw.mtx.Unlock()
+	pblw.pollWg.Wait()
+}
+
+func (pblw *pollBasedListerWatcher) ResultChan() <-chan watch.Event {
+	// Cancel any previous polling goroutine to prevent goroutine leaks
+	// when the watch is re-established after a reconnection.
+	pblw.mtx.Lock()
+	if pblw.cancelPoll != nil {
+		pblw.cancelPoll()
+	}
+	pblw.mtx.Unlock()
+	pblw.pollWg.Wait()
+
+	pollCtx, cancel := context.WithCancel(pblw.ctx)
+	pblw.mtx.Lock()
+	pblw.cancelPoll = cancel
+	pblw.mtx.Unlock()
+
+	pblw.pollWg.Go(func() {
+		jitter, err := rand.Int(rand.Reader, big.NewInt(int64(pollInterval)))
+		if err == nil {
+			select {
+			case <-time.After(time.Duration(jitter.Int64())):
+			case <-pollCtx.Done():
+				return
+			}
+		} else {
+			pblw.l.Info("failed to generate random jitter", "err", err)
+		}
+
+		_ = wait.PollUntilContextCancel(pollCtx, pollInterval, false, pblw.poll)
+	})
+
+	return pblw.ch
+}
+
+func (pblw *pollBasedListerWatcher) poll(ctx context.Context) (bool, error) {
+	var (
+		updated []*corev1.Namespace
+		deleted []string
+	)
+
+	for ns, entry := range pblw.cache {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+
+		var resourceVersion string
+		if entry.ns != nil {
+			// The resource is in the cache.
+			resourceVersion = entry.ns.ResourceVersion
+		}
+		result, err := pblw.corev1Client.Namespaces().Get(ctx, ns, metav1.GetOptions{ResourceVersion: resourceVersion})
+		if err != nil {
+			switch {
+			case apierrors.IsNotFound(err):
+				// If the namespace existed before, notify its deletion.
+				if entry.present {
+					deleted = append(deleted, ns)
+				}
+			default:
+				pblw.l.Warn("watch error", "err", err, "namespace", ns)
+			}
+			continue
+		}
+
+		if resourceVersion != result.ResourceVersion {
+			updated = append(updated, result)
+		}
+	}
+
+	for _, ns := range deleted {
+		entry := pblw.cache[ns]
+
+		select {
+		case pblw.ch <- watch.Event{
+			Type:   watch.Deleted,
+			Object: entry.ns,
+		}:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+
+		pblw.cache[ns] = cacheEntry{
+			present: false,
+		}
+	}
+
+	for _, ns := range updated {
+		var (
+			eventType = watch.Modified
+			entry     = pblw.cache[ns.Name]
+		)
+
+		switch {
+		case !entry.present:
+			eventType = watch.Added
+		case ns.ResourceVersion == entry.ns.ResourceVersion:
+			continue
+		}
+
+		select {
+		case pblw.ch <- watch.Event{
+			Type:   eventType,
+			Object: ns,
+		}:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+
+		pblw.cache[ns.Name] = cacheEntry{
+			ns:      ns,
+			present: true,
+		}
+	}
+
+	return false, nil
 }

@@ -1,4 +1,4 @@
-// Copyright 2020 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,18 +16,19 @@ package thanos
 
 import (
 	"fmt"
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
-	"github.com/kylelemons/godebug/pretty"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
-	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -42,67 +43,98 @@ var (
 	emptyQueryEndpoints = []string{""}
 )
 
-func TestStatefulSetLabelingAndAnnotations(t *testing.T) {
-	labels := map[string]string{
-		"testlabel": "testlabelvalue",
+func TestStatefulSetLabelsAndAnnotations(t *testing.T) {
+	expectedStsLabels := map[string]string{
+		// operator managed labels.
+		"managed-by":                   "prometheus-operator",
+		"thanos-ruler":                 "test",
+		"app.kubernetes.io/instance":   "test",
+		"app.kubernetes.io/managed-by": "prometheus-operator",
+		"app.kubernetes.io/name":       "thanos-ruler",
+		// user-defined labels.
+		"thanosrulerlabel": "testlabelvalue",
+		"operatorlabel":    "operator-value",
+		"podlabel":         "test-label",
 	}
-	annotations := map[string]string{
-		"testannotation": "testannotationvalue",
-		"kubectl.kubernetes.io/last-applied-configuration": "something",
-		"kubectl.kubernetes.io/something":                  "something",
+	expectedSelectorLabels := map[string]string{
+		// operator managed labels.
+		"thanos-ruler":                 "test",
+		"app.kubernetes.io/instance":   "test",
+		"app.kubernetes.io/managed-by": "prometheus-operator",
+		"app.kubernetes.io/name":       "thanos-ruler",
+		// user-defined labels.
+		"operatorlabel": "operator-value",
+		"podlabel":      "test-label",
 	}
-	// kubectl annotations must not be on the statefulset so kubectl does
-	// not manage the generated object
-	expectedAnnotations := map[string]string{
-		"prometheus-operator-input-hash": "",
-		"testannotation":                 "testannotationvalue",
+	expectedPodLabels := map[string]string{
+		// operator managed labels.
+		"thanos-ruler":                 "test",
+		"app.kubernetes.io/instance":   "test",
+		"app.kubernetes.io/managed-by": "prometheus-operator",
+		"app.kubernetes.io/name":       "thanos-ruler",
+		"app.kubernetes.io/version":    strings.TrimPrefix(operator.DefaultThanosVersion, "v"),
+		// user-defined labels.
+		"operatorlabel": "operator-value",
+		"podlabel":      "test-label",
 	}
 
+	// kubectl annotations from the ThanosRuler resource must not propagated to
+	// the statefulset and pods so kubectl does not manage the generated
+	// object.
+	expectedStsAnnotations := map[string]string{
+		"prometheus-operator-input-hash": "abc",
+		"operatorannotation":             "operator-value",
+		"thanosrulerannotation":          "testannotationvalue",
+	}
+	expectedPodAnnotations := map[string]string{
+		"kubectl.kubernetes.io/default-container": "thanos-ruler",
+		"podannotation": "test-annotation",
+	}
+
+	testConfig := Config{
+		ReloaderConfig:         operator.DefaultReloaderTestConfig.ReloaderConfig,
+		ThanosDefaultBaseImage: operator.DefaultThanosBaseImage,
+		Labels: map[string]string{
+			"operatorlabel": "operator-value",
+		},
+		Annotations: map[string]string{
+			"operatorannotation": "operator-value",
+		},
+	}
 	sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels:      labels,
-			Annotations: annotations,
+			Name:      "test",
+			Namespace: "ns",
+			Labels: map[string]string{
+				"thanosrulerlabel": "testlabelvalue",
+			},
+			Annotations: map[string]string{
+				"thanosrulerannotation":                            "testannotationvalue",
+				"kubectl.kubernetes.io/last-applied-configuration": "something",
+				"kubectl.kubernetes.io/something":                  "something",
+			},
 		},
-		Spec: monitoringv1.ThanosRulerSpec{QueryEndpoints: emptyQueryEndpoints},
-	}, defaultTestConfig, nil, "")
-
-	require.NoError(t, err)
-
-	if !reflect.DeepEqual(labels, sset.Labels) {
-		t.Log(pretty.Compare(labels, sset.Labels))
-		t.Fatal("Labels are not properly being propagated to the StatefulSet")
-	}
-
-	if !reflect.DeepEqual(expectedAnnotations, sset.Annotations) {
-		t.Log(pretty.Compare(expectedAnnotations, sset.Annotations))
-		t.Fatal("Annotations are not properly being propagated to the StatefulSet")
-	}
-}
-
-func TestPodLabelsAnnotations(t *testing.T) {
-	annotations := map[string]string{
-		"testannotation": "testvalue",
-	}
-	labels := map[string]string{
-		"testlabel": "testvalue",
-	}
-	sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
-		ObjectMeta: metav1.ObjectMeta{},
 		Spec: monitoringv1.ThanosRulerSpec{
 			QueryEndpoints: emptyQueryEndpoints,
 			PodMetadata: &monitoringv1.EmbeddedObjectMetadata{
-				Annotations: annotations,
-				Labels:      labels,
+				Labels: map[string]string{
+					"podlabel": "test-label",
+				},
+				Annotations: map[string]string{
+					"podannotation": "test-annotation",
+				},
 			},
 		},
-	}, defaultTestConfig, nil, "")
+	}, testConfig, nil, "abc", &operator.ShardedSecret{})
+
 	require.NoError(t, err)
-	if val, ok := sset.Spec.Template.ObjectMeta.Labels["testlabel"]; !ok || val != "testvalue" {
-		t.Fatal("Pod labels are not properly propagated")
-	}
-	if val, ok := sset.Spec.Template.ObjectMeta.Annotations["testannotation"]; !ok || val != "testvalue" {
-		t.Fatal("Pod annotations are not properly propagated")
-	}
+
+	require.Equal(t, expectedStsLabels, sset.Labels)
+	require.Equal(t, expectedSelectorLabels, sset.Spec.Selector.MatchLabels)
+	require.Equal(t, expectedPodLabels, sset.Spec.Template.ObjectMeta.Labels)
+
+	require.Equal(t, expectedStsAnnotations, sset.Annotations)
+	require.Equal(t, expectedPodAnnotations, sset.Spec.Template.ObjectMeta.Annotations)
 }
 
 func TestThanosDefaultBaseImageFlag(t *testing.T) {
@@ -113,57 +145,106 @@ func TestThanosDefaultBaseImageFlag(t *testing.T) {
 
 	sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
 		Spec: monitoringv1.ThanosRulerSpec{QueryEndpoints: emptyQueryEndpoints},
-	}, thanosBaseImageConfig, nil, "")
+	}, thanosBaseImageConfig, nil, "", &operator.ShardedSecret{})
 	require.NoError(t, err)
 
 	image := sset.Spec.Template.Spec.Containers[0].Image
 	expected := "nondefaultuseflag/quay.io/thanos/thanos" + ":" + operator.DefaultThanosVersion
-	if image != expected {
-		t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
-	}
-
+	require.Equal(t, expected, image)
 }
 
 func TestStatefulSetVolumes(t *testing.T) {
 	expected := &appsv1.StatefulSet{
 		Spec: appsv1.StatefulSetSpec{
-			Template: v1.PodTemplateSpec{
-				Spec: v1.PodSpec{
-					Containers: []v1.Container{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
 						{
-							VolumeMounts: []v1.VolumeMount{
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "remote-write-config",
+									ReadOnly:  true,
+									MountPath: "/etc/thanos/config/remote-write-config",
+								},
+								{
+									Name:      "tls-assets",
+									ReadOnly:  true,
+									MountPath: "/etc/thanos/certs",
+								},
+								{
+									Name:      "web-config",
+									ReadOnly:  true,
+									MountPath: "/etc/thanos/web_config/web-config.yaml",
+									SubPath:   "web-config.yaml",
+								},
 								{
 									Name:      "thanos-ruler-foo-data",
-									ReadOnly:  false,
 									MountPath: "/thanos/data",
-									SubPath:   "",
 								},
 								{
 									Name:      "rules-configmap-one",
-									ReadOnly:  false,
 									MountPath: "/etc/thanos/rules/rules-configmap-one",
-									SubPath:   "",
+									ReadOnly:  true,
+								},
+								{
+									Name:      "additional-volume",
+									MountPath: "/thanos/additional-volume",
 								},
 							},
 						},
 					},
-					Volumes: []v1.Volume{
+					Volumes: []corev1.Volume{
 						{
-							Name: "rules-configmap-one",
-							VolumeSource: v1.VolumeSource{
-								ConfigMap: &v1.ConfigMapVolumeSource{
-									LocalObjectReference: v1.LocalObjectReference{
-										Name: "rules-configmap-one",
+							Name: "remote-write-config",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: "thanos-ruler-foo-config",
+									Items: []corev1.KeyToPath{
+										{
+											Key:  "remote-write.yaml",
+											Path: "remote-write.yaml",
+										},
 									},
 								},
 							},
 						},
 						{
-							Name: "thanos-ruler-foo-data",
-							VolumeSource: v1.VolumeSource{
-								EmptyDir: &v1.EmptyDirVolumeSource{
-									Medium: "",
+							Name: "tls-assets",
+							VolumeSource: corev1.VolumeSource{
+								Projected: &corev1.ProjectedVolumeSource{
+									Sources: []corev1.VolumeProjection{},
 								},
+							},
+						},
+						{
+							Name: "web-config",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: "thanos-ruler-foo-web-config",
+								},
+							},
+						},
+						{
+							Name: "rules-configmap-one",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: "rules-configmap-one",
+									},
+									Optional: new(true),
+								},
+							},
+						},
+						{
+							Name: "thanos-ruler-foo-data",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "additional-volume",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},
 						},
 					},
@@ -171,22 +252,36 @@ func TestStatefulSetVolumes(t *testing.T) {
 			},
 		},
 	}
+
 	sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "foo",
 		},
-		Spec: monitoringv1.ThanosRulerSpec{QueryEndpoints: emptyQueryEndpoints},
-	}, defaultTestConfig, []string{"rules-configmap-one"}, "")
+		Spec: monitoringv1.ThanosRulerSpec{
+			QueryEndpoints: emptyQueryEndpoints,
+			Volumes: []corev1.Volume{
+				{
+					Name: "additional-volume",
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{
+							Medium: "",
+						},
+					},
+				},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "additional-volume",
+					ReadOnly:  false,
+					MountPath: "/thanos/additional-volume",
+					SubPath:   "",
+				},
+			},
+		},
+	}, defaultTestConfig, []string{"rules-configmap-one"}, "", &operator.ShardedSecret{})
 	require.NoError(t, err)
-	if !reflect.DeepEqual(expected.Spec.Template.Spec.Volumes, sset.Spec.Template.Spec.Volumes) {
-		fmt.Println(pretty.Compare(expected.Spec.Template.Spec.Volumes, sset.Spec.Template.Spec.Volumes))
-		t.Fatal("expected volumes to match")
-	}
-
-	if !reflect.DeepEqual(expected.Spec.Template.Spec.Containers[0].VolumeMounts, sset.Spec.Template.Spec.Containers[0].VolumeMounts) {
-		fmt.Println(pretty.Compare(expected.Spec.Template.Spec.Containers[0].VolumeMounts, sset.Spec.Template.Spec.Containers[0].VolumeMounts))
-		t.Fatal("expected volume mounts to match")
-	}
+	require.Equal(t, expected.Spec.Template.Spec.Volumes, sset.Spec.Template.Spec.Volumes)
+	require.Equal(t, expected.Spec.Template.Spec.Containers[0].VolumeMounts, sset.Spec.Template.Spec.Containers[0].VolumeMounts)
 }
 
 func TestTracing(t *testing.T) {
@@ -202,21 +297,17 @@ func TestTracing(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{},
 		Spec: monitoringv1.ThanosRulerSpec{
 			QueryEndpoints: emptyQueryEndpoints,
-			TracingConfig: &v1.SecretKeySelector{
-				LocalObjectReference: v1.LocalObjectReference{
+			TracingConfig: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{
 					Name: secretName,
 				},
 				Key: secretKey,
 			},
 		},
-	}, defaultTestConfig, nil, "")
-	if err != nil {
-		t.Fatalf("Unexpected error while making StatefulSet: %v", err)
-	}
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+	require.NoError(t, err)
 
-	if sset.Spec.Template.Spec.Containers[0].Name != containerName {
-		t.Fatalf("expected 1st containers to be thanos-ruler, got %s", sset.Spec.Template.Spec.Containers[0].Name)
-	}
+	require.Equal(t, containerName, sset.Spec.Template.Spec.Containers[0].Name)
 	{
 		var containsVolume bool
 		for _, volume := range sset.Spec.Template.Spec.Volumes {
@@ -227,9 +318,7 @@ func TestTracing(t *testing.T) {
 				}
 			}
 		}
-		if !containsVolume {
-			t.Fatalf("Thanos ruler is missing tracing-config volume with correct secret name and key")
-		}
+		require.True(t, containsVolume)
 	}
 	{
 		var containsVolumeMount bool
@@ -238,22 +327,15 @@ func TestTracing(t *testing.T) {
 				containsVolumeMount = true
 			}
 		}
-		if !containsVolumeMount {
-			t.Fatalf("Thanos ruler is missing tracing-config volume mount with correct name and mountPath")
-		}
+		require.True(t, containsVolumeMount)
 	}
 	{
 		const expectedArg = "--tracing.config-file=" + fullPath
 		var containsArg bool
-		for _, arg := range sset.Spec.Template.Spec.Containers[0].Args {
-			if arg == expectedArg {
-				containsArg = true
-				break
-			}
+		if slices.Contains(sset.Spec.Template.Spec.Containers[0].Args, expectedArg) {
+			containsArg = true
 		}
-		if !containsArg {
-			t.Fatalf("Thanos ruler is missing expected argument: %s", expectedArg)
-		}
+		require.True(t, containsArg)
 	}
 }
 
@@ -266,14 +348,12 @@ func TestTracingFile(t *testing.T) {
 		Spec: monitoringv1.ThanosRulerSpec{
 			QueryEndpoints:    emptyQueryEndpoints,
 			TracingConfigFile: testPath,
-			TracingConfig: &v1.SecretKeySelector{
+			TracingConfig: &corev1.SecretKeySelector{
 				Key: testKey,
 			},
 		},
-	}, defaultTestConfig, nil, "")
-	if err != nil {
-		t.Fatalf("Unexpected error while making StatefulSet: %v", err)
-	}
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+	require.NoError(t, err)
 
 	{
 		var containsArgConfigFile, containsArgConfig bool
@@ -291,12 +371,8 @@ func TestTracingFile(t *testing.T) {
 				}
 			}
 		}
-		if !containsArgConfigFile {
-			t.Fatalf("Thanos ruler is missing expected argument: %s", expectedArgConfigFile)
-		}
-		if containsArgConfig {
-			t.Fatalf("Thanos ruler should not contain argument: %s", expectedArgConfig)
-		}
+		require.True(t, containsArgConfigFile)
+		require.False(t, containsArgConfig)
 	}
 }
 
@@ -313,21 +389,17 @@ func TestObjectStorage(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{},
 		Spec: monitoringv1.ThanosRulerSpec{
 			QueryEndpoints: emptyQueryEndpoints,
-			ObjectStorageConfig: &v1.SecretKeySelector{
-				LocalObjectReference: v1.LocalObjectReference{
+			ObjectStorageConfig: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{
 					Name: secretName,
 				},
 				Key: secretKey,
 			},
 		},
-	}, defaultTestConfig, nil, "")
-	if err != nil {
-		t.Fatalf("Unexpected error while making StatefulSet: %v", err)
-	}
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+	require.NoError(t, err)
 
-	if sset.Spec.Template.Spec.Containers[0].Name != containerName {
-		t.Fatalf("expected 1st containers to be thanos-ruler, got %s", sset.Spec.Template.Spec.Containers[0].Name)
-	}
+	require.Equal(t, containerName, sset.Spec.Template.Spec.Containers[0].Name)
 	{
 		var containsVolume bool
 		for _, volume := range sset.Spec.Template.Spec.Volumes {
@@ -338,9 +410,7 @@ func TestObjectStorage(t *testing.T) {
 				}
 			}
 		}
-		if !containsVolume {
-			t.Fatalf("Thanos ruler is missing objstorage-config volume with correct secret name and key")
-		}
+		require.True(t, containsVolume)
 	}
 	{
 		var containsVolumeMount bool
@@ -349,22 +419,15 @@ func TestObjectStorage(t *testing.T) {
 				containsVolumeMount = true
 			}
 		}
-		if !containsVolumeMount {
-			t.Fatalf("Thanos ruler is missing objstorage-config volume mount with correct name and mountPath")
-		}
+		require.True(t, containsVolumeMount)
 	}
 	{
 		const expectedArg = "--objstore.config-file=" + fullPath
 		var containsArg bool
-		for _, arg := range sset.Spec.Template.Spec.Containers[0].Args {
-			if arg == expectedArg {
-				containsArg = true
-				break
-			}
+		if slices.Contains(sset.Spec.Template.Spec.Containers[0].Args, expectedArg) {
+			containsArg = true
 		}
-		if !containsArg {
-			t.Fatalf("Thanos ruler is missing expected argument: %s", expectedArg)
-		}
+		require.True(t, containsArg)
 	}
 }
 
@@ -377,14 +440,12 @@ func TestObjectStorageFile(t *testing.T) {
 		Spec: monitoringv1.ThanosRulerSpec{
 			QueryEndpoints:          emptyQueryEndpoints,
 			ObjectStorageConfigFile: &testPath,
-			ObjectStorageConfig: &v1.SecretKeySelector{
+			ObjectStorageConfig: &corev1.SecretKeySelector{
 				Key: testKey,
 			},
 		},
-	}, defaultTestConfig, nil, "")
-	if err != nil {
-		t.Fatalf("Unexpected error while making StatefulSet: %v", err)
-	}
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+	require.NoError(t, err)
 
 	{
 		var containsArgConfigFile, containsArgConfig bool
@@ -402,12 +463,8 @@ func TestObjectStorageFile(t *testing.T) {
 				}
 			}
 		}
-		if !containsArgConfigFile {
-			t.Fatalf("Thanos ruler is missing expected argument: %s", expectedArgConfigFile)
-		}
-		if containsArgConfig {
-			t.Fatalf("Thanos ruler should not contain argument: %s", expectedArgConfig)
-		}
+		require.True(t, containsArgConfigFile)
+		require.False(t, containsArgConfig)
 	}
 }
 
@@ -424,21 +481,17 @@ func TestAlertRelabel(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{},
 		Spec: monitoringv1.ThanosRulerSpec{
 			QueryEndpoints: emptyQueryEndpoints,
-			AlertRelabelConfigs: &v1.SecretKeySelector{
-				LocalObjectReference: v1.LocalObjectReference{
+			AlertRelabelConfigs: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{
 					Name: secretName,
 				},
 				Key: secretKey,
 			},
 		},
-	}, defaultTestConfig, nil, "")
-	if err != nil {
-		t.Fatalf("Unexpected error while making StatefulSet: %v", err)
-	}
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+	require.NoError(t, err)
 
-	if sset.Spec.Template.Spec.Containers[0].Name != containerName {
-		t.Fatalf("expected 1st containers to be thanos-ruler, got %s", sset.Spec.Template.Spec.Containers[0].Name)
-	}
+	require.Equal(t, containerName, sset.Spec.Template.Spec.Containers[0].Name)
 	{
 		var containsVolume bool
 		for _, volume := range sset.Spec.Template.Spec.Volumes {
@@ -449,9 +502,7 @@ func TestAlertRelabel(t *testing.T) {
 				}
 			}
 		}
-		if !containsVolume {
-			t.Fatalf("Thanos ruler is missing alertrelabel-config volume with correct secret name and key")
-		}
+		require.True(t, containsVolume)
 	}
 	{
 		var containsVolumeMount bool
@@ -460,22 +511,15 @@ func TestAlertRelabel(t *testing.T) {
 				containsVolumeMount = true
 			}
 		}
-		if !containsVolumeMount {
-			t.Fatalf("Thanos ruler is missing alertrelabel-config volume mount with correct name and mountPath")
-		}
+		require.True(t, containsVolumeMount)
 	}
 	{
 		const expectedArg = "--alert.relabel-config-file=" + fullPath
 		var containsArg bool
-		for _, arg := range sset.Spec.Template.Spec.Containers[0].Args {
-			if arg == expectedArg {
-				containsArg = true
-				break
-			}
+		if slices.Contains(sset.Spec.Template.Spec.Containers[0].Args, expectedArg) {
+			containsArg = true
 		}
-		if !containsArg {
-			t.Fatalf("Thanos ruler is missing expected argument: %s", expectedArg)
-		}
+		require.True(t, containsArg)
 	}
 }
 
@@ -488,14 +532,12 @@ func TestAlertRelabelFile(t *testing.T) {
 		Spec: monitoringv1.ThanosRulerSpec{
 			QueryEndpoints:         emptyQueryEndpoints,
 			AlertRelabelConfigFile: &testPath,
-			AlertRelabelConfigs: &v1.SecretKeySelector{
+			AlertRelabelConfigs: &corev1.SecretKeySelector{
 				Key: testKey,
 			},
 		},
-	}, defaultTestConfig, nil, "")
-	if err != nil {
-		t.Fatalf("Unexpected error while making StatefulSet: %v", err)
-	}
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+	require.NoError(t, err)
 
 	{
 		var containsArgConfigFile, containsArgConfigs bool
@@ -513,12 +555,8 @@ func TestAlertRelabelFile(t *testing.T) {
 				}
 			}
 		}
-		if !containsArgConfigFile {
-			t.Fatalf("Thanos ruler is missing expected argument: %s", expectedArgConfigFile)
-		}
-		if containsArgConfigs {
-			t.Fatalf("Thanos ruler should not contain argument: %s", expectedArgConfigs)
-		}
+		require.True(t, containsArgConfigFile)
+		require.False(t, containsArgConfigs)
 	}
 }
 
@@ -593,30 +631,21 @@ func TestLabelsAndAlertDropLabels(t *testing.T) {
 					Labels:          tc.Labels,
 					AlertDropLabels: tc.AlertDropLabels,
 				},
-			}, defaultTestConfig, nil, "")
-			if err != nil {
-				t.Fatalf("Unexpected error while making StatefulSet: %v", err)
-			}
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+			require.NoError(t, err)
 
 			ruler := sset.Spec.Template.Spec.Containers[0]
-			if ruler.Name != "thanos-ruler" {
-				t.Fatalf("Expected 1st containers to be thanos-ruler, got %s", ruler.Name)
-			}
+			require.Equal(t, "thanos-ruler", ruler.Name)
 
 			for _, arg := range ruler.Args {
-				if strings.HasPrefix(arg, labelPrefix) {
-					actualLabels = append(actualLabels, strings.TrimPrefix(arg, labelPrefix))
-				} else if strings.HasPrefix(arg, alertDropLabelPrefix) {
-					actualDropLabels = append(actualDropLabels, strings.TrimPrefix(arg, alertDropLabelPrefix))
+				if after, ok := strings.CutPrefix(arg, labelPrefix); ok {
+					actualLabels = append(actualLabels, after)
+				} else if after, ok := strings.CutPrefix(arg, alertDropLabelPrefix); ok {
+					actualDropLabels = append(actualDropLabels, after)
 				}
 			}
-			if !reflect.DeepEqual(actualLabels, tc.ExpectedLabels) {
-				t.Fatalf("labels mismatch expected %v but got %v", tc.ExpectedLabels, actualLabels)
-			}
-
-			if !reflect.DeepEqual(actualDropLabels, tc.ExpectedAlertDropLabels) {
-				t.Fatalf("alert drop labels mismatch, expected %v, but got %v", tc.ExpectedAlertDropLabels, actualDropLabels)
-			}
+			require.Equal(t, tc.ExpectedLabels, actualLabels)
+			require.Equal(t, tc.ExpectedAlertDropLabels, actualDropLabels)
 		})
 	}
 }
@@ -625,25 +654,23 @@ func TestAdditionalContainers(t *testing.T) {
 	// The base to compare everything against
 	baseSet, err := makeStatefulSet(&monitoringv1.ThanosRuler{
 		Spec: monitoringv1.ThanosRulerSpec{QueryEndpoints: emptyQueryEndpoints},
-	}, defaultTestConfig, nil, "")
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
 	require.NoError(t, err)
 
 	// Add an extra container
 	addSset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
 		Spec: monitoringv1.ThanosRulerSpec{
 			QueryEndpoints: emptyQueryEndpoints,
-			Containers: []v1.Container{
+			Containers: []corev1.Container{
 				{
 					Name: "extra-container",
 				},
 			},
 		},
-	}, defaultTestConfig, nil, "")
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
 	require.NoError(t, err)
 
-	if len(baseSet.Spec.Template.Spec.Containers)+1 != len(addSset.Spec.Template.Spec.Containers) {
-		t.Fatalf("container count mismatch")
-	}
+	require.Len(t, addSset.Spec.Template.Spec.Containers, len(baseSet.Spec.Template.Spec.Containers)+1)
 
 	// Adding a new container with the same name results in a merge and just one container
 	const existingContainerName = "thanos-ruler"
@@ -651,25 +678,21 @@ func TestAdditionalContainers(t *testing.T) {
 	modSset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
 		Spec: monitoringv1.ThanosRulerSpec{
 			QueryEndpoints: emptyQueryEndpoints,
-			Containers: []v1.Container{
+			Containers: []corev1.Container{
 				{
 					Name:  existingContainerName,
 					Image: containerImage,
 				},
 			},
 		},
-	}, defaultTestConfig, nil, "")
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
 	require.NoError(t, err)
 
-	if len(baseSet.Spec.Template.Spec.Containers) != len(modSset.Spec.Template.Spec.Containers) {
-		t.Fatalf("container count mismatch. container %s was added instead of merged", existingContainerName)
-	}
+	require.Equal(t, len(baseSet.Spec.Template.Spec.Containers), len(modSset.Spec.Template.Spec.Containers))
 
 	// Check that adding a container with an existing name results in a single patched container.
 	for _, c := range modSset.Spec.Template.Spec.Containers {
-		if c.Name == existingContainerName && c.Image != containerImage {
-			t.Fatalf("expected container %s to have the image %s but got %s", existingContainerName, containerImage, c.Image)
-		}
+		require.False(t, c.Name == existingContainerName && c.Image != containerImage)
 	}
 }
 
@@ -686,24 +709,146 @@ func TestRetention(t *testing.T) {
 					Retention:      tc.specRetention,
 					QueryEndpoints: emptyQueryEndpoints,
 				},
-			}, defaultTestConfig, nil, "")
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
 
-			if err != nil {
-				t.Fatalf("expecting no error but got %q", err)
-			}
+			require.NoError(t, err)
 
 			trArgs := sset.Spec.Template.Spec.Containers[0].Args
-			expectedRetentionArg := fmt.Sprintf("--tsdb.retention=%s", tc.expectedRetention)
-			found := false
-			for _, flag := range trArgs {
-				if flag == expectedRetentionArg {
-					found = true
-					break
-				}
-			}
+			require.True(t, slices.Contains(trArgs, fmt.Sprintf("--tsdb.retention=%s", tc.expectedRetention)))
+		})
+	}
+}
 
-			if !found {
-				t.Fatalf("expected ThanosRuler args to contain %v, but got %v", expectedRetentionArg, trArgs)
+func TestThanosGrpcArguments(t *testing.T) {
+	sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+		Spec: monitoringv1.ThanosRulerSpec{
+			Version:        new("0.37.0"),
+			QueryEndpoints: emptyQueryEndpoints,
+			GRPCServerTLSConfig: &monitoringv1.GRPCServerTLSConfig{
+				TLSConfig: monitoringv1.TLSConfig{
+					SafeTLSConfig: monitoringv1.SafeTLSConfig{
+						MinVersion: ptr.To(monitoringv1.TLSVersion13),
+					},
+					TLSFilesConfig: monitoringv1.TLSFilesConfig{
+						CAFile:   "/tmp/ca",
+						CertFile: "/tmp/cert",
+						KeyFile:  "/tmp/key",
+					},
+				},
+			},
+		},
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+
+	require.NoError(t, err)
+
+	trArgs := sset.Spec.Template.Spec.Containers[0].Args
+	require.True(t, slices.Contains(trArgs, "--grpc-server-tls-cert=/tmp/cert"))
+	require.True(t, slices.Contains(trArgs, "--grpc-server-tls-key=/tmp/key"))
+	require.True(t, slices.Contains(trArgs, "--grpc-server-tls-client-ca=/tmp/ca"))
+	require.True(t, slices.Contains(trArgs, "--grpc-server-tls-min-version=1.3"))
+}
+
+func TestGRPCServerTLSCipherSuites(t *testing.T) {
+	ciphers := []string{"TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384"}
+
+	for _, tc := range []struct {
+		scenario      string
+		version       string
+		cipherSuites  []string
+		shouldHaveArg bool
+	}{
+		{
+			scenario:      "version >= 0.42.0 with cipher suites",
+			version:       "0.42.0",
+			cipherSuites:  ciphers,
+			shouldHaveArg: true,
+		},
+		{
+			scenario:      "version < 0.42.0 with cipher suites",
+			version:       "0.41.0",
+			cipherSuites:  ciphers,
+			shouldHaveArg: false,
+		},
+		{
+			scenario:      "version >= 0.42.0 without cipher suites",
+			version:       "0.42.0",
+			cipherSuites:  nil,
+			shouldHaveArg: false,
+		},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+				Spec: monitoringv1.ThanosRulerSpec{
+					Version:        new(tc.version),
+					QueryEndpoints: emptyQueryEndpoints,
+					GRPCServerTLSConfig: &monitoringv1.GRPCServerTLSConfig{
+						CipherSuites: tc.cipherSuites,
+					},
+				},
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+
+			require.NoError(t, err)
+
+			trArgs := sset.Spec.Template.Spec.Containers[0].Args
+			expectedArgs := []string{
+				"--grpc-server-tls-ciphers=TLS_AES_128_GCM_SHA256",
+				"--grpc-server-tls-ciphers=TLS_AES_256_GCM_SHA384",
+			}
+			for _, expectedArg := range expectedArgs {
+				require.Equal(t, tc.shouldHaveArg, slices.Contains(trArgs, expectedArg), "expected %q presence to be %v", expectedArg, tc.shouldHaveArg)
+			}
+		})
+	}
+}
+
+func TestGRPCServerTLSCurves(t *testing.T) {
+	curves := []string{"CurveP256", "X25519"}
+
+	for _, tc := range []struct {
+		scenario      string
+		version       string
+		curves        []string
+		shouldHaveArg bool
+	}{
+		{
+			scenario:      "version >= 0.42.0 with curve preferences",
+			version:       "0.42.0",
+			curves:        curves,
+			shouldHaveArg: true,
+		},
+		{
+			scenario:      "version < 0.42.0 with curve preferences",
+			version:       "0.41.0",
+			curves:        curves,
+			shouldHaveArg: false,
+		},
+		{
+			scenario:      "version >= 0.42.0 without curve preferences",
+			version:       "0.42.0",
+			curves:        nil,
+			shouldHaveArg: false,
+		},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+				Spec: monitoringv1.ThanosRulerSpec{
+					Version:        new(tc.version),
+					QueryEndpoints: emptyQueryEndpoints,
+					GRPCServerTLSConfig: &monitoringv1.GRPCServerTLSConfig{
+						Curves: tc.curves,
+					},
+				},
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+
+			require.NoError(t, err)
+
+			trArgs := sset.Spec.Template.Spec.Containers[0].Args
+			expectedArgs := []string{
+				"--grpc-server-tls-curves=CurveP256",
+				"--grpc-server-tls-curves=X25519",
+			}
+			for _, expectedArg := range expectedArgs {
+				require.Equal(t, tc.shouldHaveArg, slices.Contains(trArgs, expectedArg), "expected %q presence to be %v", expectedArg, tc.shouldHaveArg)
 			}
 		})
 	}
@@ -713,28 +858,28 @@ func TestPodTemplateConfig(t *testing.T) {
 	nodeSelector := map[string]string{
 		"foo": "bar",
 	}
-	affinity := v1.Affinity{
-		NodeAffinity: &v1.NodeAffinity{},
-		PodAffinity: &v1.PodAffinity{
-			PreferredDuringSchedulingIgnoredDuringExecution: []v1.WeightedPodAffinityTerm{
+	affinity := corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{},
+		PodAffinity: &corev1.PodAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
 				{
-					PodAffinityTerm: v1.PodAffinityTerm{
+					PodAffinityTerm: corev1.PodAffinityTerm{
 						Namespaces: []string{"foo"},
 					},
 					Weight: 100,
 				},
 			},
 		},
-		PodAntiAffinity: &v1.PodAntiAffinity{},
+		PodAntiAffinity: &corev1.PodAntiAffinity{},
 	}
 
-	tolerations := []v1.Toleration{
+	tolerations := []corev1.Toleration{
 		{
 			Key: "key",
 		},
 	}
 	userid := int64(1234)
-	securityContext := v1.PodSecurityContext{
+	securityContext := corev1.PodSecurityContext{
 		RunAsUser: &userid,
 	}
 	priorityClassName := "foo"
@@ -745,16 +890,19 @@ func TestPodTemplateConfig(t *testing.T) {
 			IP:        "1.1.1.1",
 		},
 	}
-	imagePullSecrets := []v1.LocalObjectReference{
+	imagePullSecrets := []corev1.LocalObjectReference{
 		{
 			Name: "registry-secret",
 		},
 	}
-	imagePullPolicy := v1.PullAlways
+	imagePullPolicy := corev1.PullAlways
 
 	additionalArgs := []monitoringv1.Argument{
 		{Name: "additional.arg", Value: "additional-arg-value"},
 	}
+
+	schedulerName := "my-scheduler"
+	hostUsers := true
 
 	sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
 		ObjectMeta: metav1.ObjectMeta{},
@@ -770,54 +918,30 @@ func TestPodTemplateConfig(t *testing.T) {
 			ImagePullSecrets:   imagePullSecrets,
 			ImagePullPolicy:    imagePullPolicy,
 			AdditionalArgs:     additionalArgs,
+			SchedulerName:      schedulerName,
+			HostUsers:          new(true),
 		},
-	}, defaultTestConfig, nil, "")
-	if err != nil {
-		t.Fatalf("Unexpected error while making StatefulSet: %v", err)
-	}
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+	require.NoError(t, err)
 
-	if !reflect.DeepEqual(sset.Spec.Template.Spec.NodeSelector, nodeSelector) {
-		t.Fatalf("expected node selector to match, want %v, got %v", nodeSelector, sset.Spec.Template.Spec.NodeSelector)
-	}
-	if !reflect.DeepEqual(*sset.Spec.Template.Spec.Affinity, affinity) {
-		t.Fatalf("expected affinity to match, want %v, got %v", affinity, *sset.Spec.Template.Spec.Affinity)
-	}
-	if !reflect.DeepEqual(sset.Spec.Template.Spec.Tolerations, tolerations) {
-		t.Fatalf("expected tolerations to match, want %v, got %v", tolerations, sset.Spec.Template.Spec.Tolerations)
-	}
-	if !reflect.DeepEqual(*sset.Spec.Template.Spec.SecurityContext, securityContext) {
-		t.Fatalf("expected security context  to match, want %v, got %v", securityContext, *sset.Spec.Template.Spec.SecurityContext)
-	}
-	if sset.Spec.Template.Spec.PriorityClassName != priorityClassName {
-		t.Fatalf("expected priority class name to match, want %s, got %s", priorityClassName, sset.Spec.Template.Spec.PriorityClassName)
-	}
-	if sset.Spec.Template.Spec.ServiceAccountName != serviceAccountName {
-		t.Fatalf("expected service account name to match, want %s, got %s", serviceAccountName, sset.Spec.Template.Spec.ServiceAccountName)
-	}
-	if len(sset.Spec.Template.Spec.HostAliases) != len(hostAliases) {
-		t.Fatalf("expected length of host aliases to match, want %d, got %d", len(hostAliases), len(sset.Spec.Template.Spec.HostAliases))
-	}
-	if !reflect.DeepEqual(sset.Spec.Template.Spec.ImagePullSecrets, imagePullSecrets) {
-		t.Fatalf("expected image pull secrets to match, want %s, got %s", imagePullSecrets, sset.Spec.Template.Spec.ImagePullSecrets)
-	}
+	require.Equal(t, nodeSelector, sset.Spec.Template.Spec.NodeSelector)
+	require.Equal(t, affinity, *sset.Spec.Template.Spec.Affinity)
+	require.Equal(t, tolerations, sset.Spec.Template.Spec.Tolerations)
+	require.Equal(t, securityContext, *sset.Spec.Template.Spec.SecurityContext)
+	require.Equal(t, priorityClassName, sset.Spec.Template.Spec.PriorityClassName)
+	require.Equal(t, serviceAccountName, sset.Spec.Template.Spec.ServiceAccountName)
+	require.Equal(t, schedulerName, sset.Spec.Template.Spec.SchedulerName)
+	require.Equal(t, len(hostAliases), len(sset.Spec.Template.Spec.HostAliases))
+	require.Equal(t, imagePullSecrets, sset.Spec.Template.Spec.ImagePullSecrets)
+	require.Equal(t, hostUsers, *sset.Spec.Template.Spec.HostUsers)
 	for _, initContainer := range sset.Spec.Template.Spec.InitContainers {
-		if !reflect.DeepEqual(initContainer.ImagePullPolicy, imagePullPolicy) {
-			t.Fatalf("expected imagePullPolicy to match, want %s, got %s", imagePullPolicy, sset.Spec.Template.Spec.Containers[0].ImagePullPolicy)
-		}
+		require.Equal(t, imagePullPolicy, initContainer.ImagePullPolicy)
 	}
 	for _, container := range sset.Spec.Template.Spec.Containers {
-		if !reflect.DeepEqual(container.ImagePullPolicy, imagePullPolicy) {
-			t.Fatalf("expected imagePullPolicy to match, want %s, got %s", imagePullPolicy, sset.Spec.Template.Spec.Containers[0].ImagePullPolicy)
-		}
+		require.Equal(t, imagePullPolicy, container.ImagePullPolicy)
 	}
-	if !strings.Contains(
-		sset.Spec.Template.Spec.Containers[0].Args[len(sset.Spec.Template.Spec.Containers[0].Args)-1],
-		"--additional.arg=additional-arg-value") {
-		t.Fatalf("expected additional arguments to match, want %s, got %s", additionalArgs, sset.Spec.Template.Spec.Containers[0].Args[len(sset.Spec.Template.Spec.Containers[0].Args)-1])
-	}
-	if sset.Spec.Template.Spec.Containers[0].Args[0] != "rule" {
-		t.Fatalf("expected first argument to match, want `rule`, got %s", sset.Spec.Template.Spec.Containers[0].Args[0])
-	}
+	require.Contains(t, sset.Spec.Template.Spec.Containers[0].Args[len(sset.Spec.Template.Spec.Containers[0].Args)-1], "--additional.arg=additional-arg-value")
+	require.Equal(t, "rule", sset.Spec.Template.Spec.Containers[0].Args[0])
 }
 
 func TestExternalQueryURL(t *testing.T) {
@@ -826,22 +950,15 @@ func TestExternalQueryURL(t *testing.T) {
 			AlertQueryURL:  "https://example.com/",
 			QueryEndpoints: emptyQueryEndpoints,
 		},
-	}, defaultTestConfig, nil, "")
-	if err != nil {
-		t.Fatalf("Unexpected error while making StatefulSet: %v", err)
-	}
-
-	if sset.Spec.Template.Spec.Containers[0].Name != containerName {
-		t.Fatalf("expected 1st containers to be thanos-ruler, got %s", sset.Spec.Template.Spec.Containers[0].Name)
-	}
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+	require.NoError(t, err)
+	require.Equal(t, containerName, sset.Spec.Template.Spec.Containers[0].Name)
 
 	const expectedArg = "--alert.query-url=https://example.com/"
-	for _, arg := range sset.Spec.Template.Spec.Containers[0].Args {
-		if arg == expectedArg {
-			return
-		}
+	if slices.Contains(sset.Spec.Template.Spec.Containers[0].Args, expectedArg) {
+		return
 	}
-	t.Fatalf("Thanos ruler is missing expected argument: %s", expectedArg)
+	require.FailNow(t, "Thanos ruler is missing expected argument: %s", expectedArg)
 }
 
 func TestSidecarResources(t *testing.T) {
@@ -857,7 +974,7 @@ func TestSidecarResources(t *testing.T) {
 		}
 		// thanos-ruler sset will only have a configReloader side car
 		// if it has to mount a ConfigMap
-		sset, err := makeStatefulSet(tr, testConfig, []string{"my-configmap"}, "")
+		sset, err := makeStatefulSet(tr, testConfig, []string{"my-configmap"}, "", &operator.ShardedSecret{})
 		require.NoError(t, err)
 		return sset
 	})
@@ -871,24 +988,29 @@ func TestStatefulSetMinReadySeconds(t *testing.T) {
 		},
 	}
 
-	statefulSet, err := makeStatefulSetSpec(&tr, defaultTestConfig, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if statefulSet.MinReadySeconds != 0 {
-		t.Fatalf("expected MinReadySeconds to be zero but got %d", statefulSet.MinReadySeconds)
-	}
+	statefulSet, err := makeStatefulSetSpec(&tr, defaultTestConfig, nil, &operator.ShardedSecret{})
+	require.NoError(t, err)
+	require.Equal(t, int32(0), statefulSet.MinReadySeconds)
 
 	// assert set correctly if not nil
-	var expect uint32 = 5
-	tr.Spec.MinReadySeconds = &expect
-	statefulSet, err = makeStatefulSetSpec(&tr, defaultTestConfig, nil)
-	if err != nil {
-		t.Fatal(err)
+	tr.Spec.MinReadySeconds = new(int32(5))
+	statefulSet, err = makeStatefulSetSpec(&tr, defaultTestConfig, nil, &operator.ShardedSecret{})
+	require.NoError(t, err)
+	require.Equal(t, int32(5), statefulSet.MinReadySeconds)
+}
+
+func TestStatefulSetServiceName(t *testing.T) {
+	tr := monitoringv1.ThanosRuler{
+		Spec: monitoringv1.ThanosRulerSpec{
+			QueryEndpoints: emptyQueryEndpoints,
+		},
 	}
-	if statefulSet.MinReadySeconds != int32(expect) {
-		t.Fatalf("expected MinReadySeconds to be %d but got %d", expect, statefulSet.MinReadySeconds)
-	}
+
+	// assert set correctly
+	expect := governingServiceName
+	spec, err := makeStatefulSetSpec(&tr, defaultTestConfig, nil, &operator.ShardedSecret{})
+	require.NoError(t, err)
+	require.Equal(t, expect, spec.ServiceName)
 }
 
 func TestStatefulSetPVC(t *testing.T) {
@@ -905,8 +1027,8 @@ func TestStatefulSetPVC(t *testing.T) {
 		EmbeddedObjectMetadata: monitoringv1.EmbeddedObjectMetadata{
 			Annotations: annotations,
 		},
-		Spec: v1.PersistentVolumeClaimSpec{
-			AccessModes:      []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			StorageClassName: &storageClass,
 		},
 	}
@@ -922,13 +1044,11 @@ func TestStatefulSetPVC(t *testing.T) {
 				VolumeClaimTemplate: pvc,
 			},
 		},
-	}, defaultTestConfig, nil, "")
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
 
 	require.NoError(t, err)
 	ssetPvc := sset.Spec.VolumeClaimTemplates[0]
-	if !reflect.DeepEqual(*pvc.Spec.StorageClassName, *ssetPvc.Spec.StorageClassName) {
-		t.Fatal("Error adding PVC Spec to StatefulSetSpec")
-	}
+	require.Equal(t, *pvc.Spec.StorageClassName, *ssetPvc.Spec.StorageClassName)
 }
 
 func TestStatefulEmptyDir(t *testing.T) {
@@ -939,8 +1059,8 @@ func TestStatefulEmptyDir(t *testing.T) {
 		"testannotation": "testannotationvalue",
 	}
 
-	emptyDir := v1.EmptyDirVolumeSource{
-		Medium: v1.StorageMediumMemory,
+	emptyDir := corev1.EmptyDirVolumeSource{
+		Medium: corev1.StorageMediumMemory,
 	}
 
 	sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
@@ -954,13 +1074,12 @@ func TestStatefulEmptyDir(t *testing.T) {
 				EmptyDir: &emptyDir,
 			},
 		},
-	}, defaultTestConfig, nil, "")
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
 
 	require.NoError(t, err)
 	ssetVolumes := sset.Spec.Template.Spec.Volumes
-	if ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir == nil || !reflect.DeepEqual(emptyDir.Medium, ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir.Medium) {
-		t.Fatal("Error adding EmptyDir Spec to StatefulSetSpec")
-	}
+	require.NotNil(t, ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir)
+	require.Equal(t, emptyDir.Medium, ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir.Medium)
 }
 
 func TestStatefulSetEphemeral(t *testing.T) {
@@ -973,10 +1092,10 @@ func TestStatefulSetEphemeral(t *testing.T) {
 
 	storageClass := "storageclass"
 
-	ephemeral := v1.EphemeralVolumeSource{
-		VolumeClaimTemplate: &v1.PersistentVolumeClaimTemplate{
-			Spec: v1.PersistentVolumeClaimSpec{
-				AccessModes:      []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+	ephemeral := corev1.EphemeralVolumeSource{
+		VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 				StorageClassName: &storageClass,
 			},
 		},
@@ -993,14 +1112,12 @@ func TestStatefulSetEphemeral(t *testing.T) {
 				Ephemeral: &ephemeral,
 			},
 		},
-	}, defaultTestConfig, nil, "")
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
 
 	require.NoError(t, err)
 	ssetVolumes := sset.Spec.Template.Spec.Volumes
-	if ssetVolumes[len(ssetVolumes)-1].VolumeSource.Ephemeral == nil ||
-		!reflect.DeepEqual(ephemeral.VolumeClaimTemplate.Spec.StorageClassName, ssetVolumes[len(ssetVolumes)-1].VolumeSource.Ephemeral.VolumeClaimTemplate.Spec.StorageClassName) {
-		t.Fatal("Error adding Ephemeral Spec to StatefulSetSpec")
-	}
+	require.NotNil(t, ssetVolumes[len(ssetVolumes)-1].VolumeSource.Ephemeral)
+	require.Equal(t, ephemeral.VolumeClaimTemplate.Spec.StorageClassName, ssetVolumes[len(ssetVolumes)-1].VolumeSource.Ephemeral.VolumeClaimTemplate.Spec.StorageClassName)
 }
 
 func TestThanosVersion(t *testing.T) {
@@ -1016,24 +1133,497 @@ func TestThanosVersion(t *testing.T) {
 		{"0.29.0-0123", "", true},
 		{"0.29.0.DEV", "", true},
 	} {
-		t.Run(string(tc.version), func(t *testing.T) {
+		t.Run(tc.version, func(t *testing.T) {
 			sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
 				Spec: monitoringv1.ThanosRulerSpec{
 					QueryEndpoints: emptyQueryEndpoints,
-					Version:        tc.version,
+					Version:        new(tc.version),
 				},
-			}, defaultTestConfig, nil, "")
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
 
-			if tc.expectedError && err == nil {
-				t.Fatal("expected error but got nil")
+			if tc.expectedError {
+				require.Error(t, err)
 			}
 
 			if !tc.expectedError {
 				image := sset.Spec.Template.Spec.Containers[0].Image
-				if image != tc.expectedImage {
-					t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", tc.expectedImage, image)
+				require.Equal(t, tc.expectedImage, image)
+			}
+		})
+	}
+}
+
+func TestStatefulSetDNSPolicyAndDNSConfig(t *testing.T) {
+	sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+		ObjectMeta: metav1.ObjectMeta{},
+		Spec: monitoringv1.ThanosRulerSpec{
+			QueryEndpoints: emptyQueryEndpoints,
+			DNSPolicy:      ptr.To(monitoringv1.DNSClusterFirst),
+			DNSConfig: &monitoringv1.PodDNSConfig{
+				Nameservers: []string{"8.8.8.8"},
+				Searches:    []string{"custom.search"},
+				Options: []monitoringv1.PodDNSConfigOption{
+					{
+						Name:  "ndots",
+						Value: new("5"),
+					},
+				},
+			},
+		},
+	}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+	require.NoError(t, err)
+
+	require.Equal(t, corev1.DNSClusterFirst, sset.Spec.Template.Spec.DNSPolicy, "expected DNS policy to match")
+	require.Equal(t, &corev1.PodDNSConfig{
+		Nameservers: []string{"8.8.8.8"},
+		Searches:    []string{"custom.search"},
+		Options: []corev1.PodDNSConfigOption{
+			{
+				Name:  "ndots",
+				Value: new("5"),
+			},
+		},
+	}, sset.Spec.Template.Spec.DNSConfig, "expected DNS configuration to match")
+}
+
+func TestStatefulSetenableServiceLinks(t *testing.T) {
+	tests := []struct {
+		enableServiceLinks         *bool
+		expectedEnableServiceLinks *bool
+	}{
+		{enableServiceLinks: new(false), expectedEnableServiceLinks: new(false)},
+		{enableServiceLinks: new(true), expectedEnableServiceLinks: new(true)},
+		{enableServiceLinks: nil, expectedEnableServiceLinks: nil},
+	}
+
+	for _, test := range tests {
+		sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+			ObjectMeta: metav1.ObjectMeta{},
+			Spec: monitoringv1.ThanosRulerSpec{
+				QueryEndpoints:     emptyQueryEndpoints,
+				EnableServiceLinks: test.enableServiceLinks,
+			},
+		}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+		require.NoError(t, err)
+
+		if test.expectedEnableServiceLinks != nil {
+			require.NotNil(t, sset.Spec.Template.Spec.EnableServiceLinks, "expected enableServiceLinks to be non-nil")
+			require.Equal(t, *test.expectedEnableServiceLinks, *sset.Spec.Template.Spec.EnableServiceLinks, "expected enableServiceLinks to match")
+		} else {
+			require.Nil(t, sset.Spec.Template.Spec.EnableServiceLinks, "expected enableServiceLinks to be nil")
+		}
+	}
+}
+
+func TestRuleQueryOffset(t *testing.T) {
+	ruleQueryOffset := monitoringv1.Duration("5m")
+
+	tt := []struct {
+		scenario        string
+		version         string
+		ruleQueryOffset *monitoringv1.Duration
+		shouldHaveArg   bool
+	}{{
+		scenario:        "version >= 0.38.0 with rule query offset",
+		version:         "0.38.0",
+		ruleQueryOffset: &ruleQueryOffset,
+		shouldHaveArg:   true,
+	}, {
+		scenario:        "version < 0.38.0 with rule query offset",
+		version:         "0.37.0",
+		ruleQueryOffset: &ruleQueryOffset,
+		shouldHaveArg:   false,
+	}, {
+		scenario:        "version >= 0.38.0 without rule query offset",
+		version:         "0.38.0",
+		ruleQueryOffset: nil,
+		shouldHaveArg:   false,
+	}}
+
+	for _, ts := range tt {
+		t.Run(ts.scenario, func(t *testing.T) {
+			version := ts.version
+
+			sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+				Spec: monitoringv1.ThanosRulerSpec{
+					Version:         &version,
+					RuleQueryOffset: ts.ruleQueryOffset,
+					QueryEndpoints:  emptyQueryEndpoints,
+				},
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+
+			require.NoError(t, err)
+
+			trArgs := sset.Spec.Template.Spec.Containers[0].Args
+
+			found := false
+			for _, flag := range trArgs {
+				if strings.HasPrefix(flag, "--rule-query-offset=") {
+					found = true
+					break
 				}
 			}
+
+			require.Equal(t, ts.shouldHaveArg, found)
+		})
+	}
+}
+
+func TestRuleConcurrentEval(t *testing.T) {
+	ruleConcurrentEval := int32(5)
+
+	tt := []struct {
+		scenario           string
+		version            string
+		ruleConcurrentEval *int32
+		shouldHaveArg      bool
+	}{{
+		scenario:           "version >= 0.37.0 with rule concurrent evaluation",
+		version:            "0.37.0",
+		ruleConcurrentEval: &ruleConcurrentEval,
+		shouldHaveArg:      true,
+	}, {
+		scenario:           "version < 0.37.0 with rule concurrent evaluation",
+		version:            "0.36.0",
+		ruleConcurrentEval: &ruleConcurrentEval,
+		shouldHaveArg:      false,
+	}, {
+		scenario:           "version >= 0.37.0 without rule concurrent evaluation",
+		version:            "0.37.0",
+		ruleConcurrentEval: nil,
+		shouldHaveArg:      false,
+	}}
+
+	for _, ts := range tt {
+		t.Run(ts.scenario, func(t *testing.T) {
+			version := ts.version
+
+			sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+				Spec: monitoringv1.ThanosRulerSpec{
+					Version:            &version,
+					RuleConcurrentEval: ts.ruleConcurrentEval,
+					QueryEndpoints:     emptyQueryEndpoints,
+				},
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+
+			require.NoError(t, err)
+
+			trArgs := sset.Spec.Template.Spec.Containers[0].Args
+
+			found := false
+			for _, flag := range trArgs {
+				if strings.HasPrefix(flag, "--rule-concurrent-evaluation=") {
+					found = true
+					break
+				}
+			}
+
+			require.Equal(t, ts.shouldHaveArg, found)
+		})
+	}
+}
+
+func TestRuleOutageTolerance(t *testing.T) {
+	ruleOutageTolerance := monitoringv1.Duration("1h")
+
+	tt := []struct {
+		scenario            string
+		version             string
+		ruleOutageTolerance *monitoringv1.Duration
+		shouldHaveArg       bool
+	}{{
+		scenario:            "version >= 0.30.0 with for outage tolerance",
+		version:             "0.30.0",
+		ruleOutageTolerance: &ruleOutageTolerance,
+		shouldHaveArg:       true,
+	}, {
+		scenario:            "version < 0.30.0 with for outage tolerance",
+		version:             "0.29.0",
+		ruleOutageTolerance: &ruleOutageTolerance,
+		shouldHaveArg:       false,
+	}, {
+		scenario:            "version > 0.30.0 without for outage tolerance",
+		version:             "0.37.0",
+		ruleOutageTolerance: nil,
+		shouldHaveArg:       false,
+	}}
+
+	for _, ts := range tt {
+		t.Run(ts.scenario, func(t *testing.T) {
+			version := ts.version
+
+			sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+				Spec: monitoringv1.ThanosRulerSpec{
+					Version:             &version,
+					RuleOutageTolerance: ts.ruleOutageTolerance,
+					QueryEndpoints:      emptyQueryEndpoints,
+				},
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+
+			require.NoError(t, err)
+
+			trArgs := sset.Spec.Template.Spec.Containers[0].Args
+
+			found := false
+			for _, flag := range trArgs {
+				if strings.HasPrefix(flag, "--for-outage-tolerance=") {
+					found = true
+					break
+				}
+			}
+
+			require.Equal(t, ts.shouldHaveArg, found)
+		})
+	}
+}
+
+func TestRuleGracePeriod(t *testing.T) {
+	ruleGracePeriod := monitoringv1.Duration("10m")
+
+	tt := []struct {
+		scenario        string
+		version         string
+		ruleGracePeriod *monitoringv1.Duration
+		shouldHaveArg   bool
+	}{{
+		scenario:        "version >= 0.30.0 with rule query offset",
+		version:         "0.30.0",
+		ruleGracePeriod: &ruleGracePeriod,
+		shouldHaveArg:   true,
+	}, {
+		scenario:        "version < 0.30.0 with rule query offset",
+		version:         "0.29.0",
+		ruleGracePeriod: &ruleGracePeriod,
+		shouldHaveArg:   false,
+	}, {
+		scenario:        "version >= 0.30.0 without rule query offset",
+		version:         "0.30.0",
+		ruleGracePeriod: nil,
+		shouldHaveArg:   false,
+	}}
+
+	for _, ts := range tt {
+		t.Run(ts.scenario, func(t *testing.T) {
+			version := ts.version
+
+			sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+				Spec: monitoringv1.ThanosRulerSpec{
+					Version:         &version,
+					RuleGracePeriod: ts.ruleGracePeriod,
+					QueryEndpoints:  emptyQueryEndpoints,
+				},
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+
+			require.NoError(t, err)
+
+			trArgs := sset.Spec.Template.Spec.Containers[0].Args
+
+			found := false
+			for _, flag := range trArgs {
+				if strings.HasPrefix(flag, "--for-grace-period=") {
+					found = true
+					break
+				}
+			}
+
+			require.Equal(t, ts.shouldHaveArg, found)
+		})
+	}
+}
+
+func TestRuleResendDelay(t *testing.T) {
+	tt := []struct {
+		scenario      string
+		resendDelay   *monitoringv1.Duration
+		shouldHaveArg bool
+	}{{
+		scenario:      "resend delay defined",
+		resendDelay:   ptr.To(monitoringv1.Duration("1h")),
+		shouldHaveArg: true,
+	}, {
+		scenario:      "resend-delay is nil",
+		resendDelay:   nil,
+		shouldHaveArg: false,
+	}}
+
+	for _, ts := range tt {
+		t.Run(ts.scenario, func(t *testing.T) {
+
+			sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+				Spec: monitoringv1.ThanosRulerSpec{
+					ResendDelay:    ts.resendDelay,
+					QueryEndpoints: emptyQueryEndpoints,
+				},
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+
+			require.NoError(t, err)
+
+			trArgs := sset.Spec.Template.Spec.Containers[0].Args
+
+			found := false
+			for _, flag := range trArgs {
+				if strings.HasPrefix(flag, "--resend-delay=") {
+					found = true
+					break
+				}
+			}
+
+			require.Equal(t, ts.shouldHaveArg, found)
+		})
+	}
+}
+
+func TestEnableFeatures(t *testing.T) {
+	tt := []struct {
+		scenario       string
+		version        string
+		enableFeatures []monitoringv1.EnableFeature
+		shouldHaveArg  bool
+		expectedValue  string
+	}{{
+		scenario:       "version >= 0.39.0 with single feature",
+		version:        "0.39.0",
+		enableFeatures: []monitoringv1.EnableFeature{"promql-experimental-functions"},
+		shouldHaveArg:  true,
+		expectedValue:  "promql-experimental-functions",
+	}, {
+		scenario:       "version < 0.39.0 with features",
+		version:        "0.38.0",
+		enableFeatures: []monitoringv1.EnableFeature{"promql-experimental-functions"},
+		shouldHaveArg:  false,
+		expectedValue:  "",
+	}, {
+		scenario:       "version >= 0.39.0 with empty features",
+		version:        "0.39.0",
+		enableFeatures: []monitoringv1.EnableFeature{},
+		shouldHaveArg:  false,
+		expectedValue:  "",
+	}, {
+		scenario:       "version >= 0.39.0 with nil features",
+		version:        "0.39.0",
+		enableFeatures: nil,
+		shouldHaveArg:  false,
+		expectedValue:  "",
+	}}
+
+	for _, ts := range tt {
+		t.Run(ts.scenario, func(t *testing.T) {
+			version := ts.version
+
+			sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+				Spec: monitoringv1.ThanosRulerSpec{
+					Version:        &version,
+					EnableFeatures: ts.enableFeatures,
+					QueryEndpoints: emptyQueryEndpoints,
+				},
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+
+			require.NoError(t, err)
+
+			trArgs := sset.Spec.Template.Spec.Containers[0].Args
+
+			found := false
+			var actualValue string
+			for _, flag := range trArgs {
+				if strings.HasPrefix(flag, "--enable-feature=") {
+					found = true
+					actualValue = strings.TrimPrefix(flag, "--enable-feature=")
+					break
+				}
+			}
+
+			require.Equal(t, ts.shouldHaveArg, found)
+			if ts.shouldHaveArg {
+				require.Equal(t, ts.expectedValue, actualValue)
+			}
+		})
+	}
+}
+
+func TestStatefulSetPodManagementPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		podManagementPolicy *monitoringv1.PodManagementPolicyType
+		exp                 appsv1.PodManagementPolicyType
+	}{
+		{
+			podManagementPolicy: nil,
+			exp:                 appsv1.ParallelPodManagement,
+		},
+		{
+			podManagementPolicy: ptr.To(monitoringv1.ParallelPodManagement),
+			exp:                 appsv1.ParallelPodManagement,
+		},
+		{
+			podManagementPolicy: ptr.To(monitoringv1.OrderedReadyPodManagement),
+			exp:                 appsv1.OrderedReadyPodManagement,
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+				Spec: monitoringv1.ThanosRulerSpec{
+					PodManagementPolicy: tc.podManagementPolicy,
+					QueryEndpoints:      emptyQueryEndpoints,
+				},
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+
+			require.NoError(t, err)
+			require.Equal(t, tc.exp, sset.Spec.PodManagementPolicy)
+		})
+	}
+}
+
+func TestStatefulSetUpdateStrategy(t *testing.T) {
+	for _, tc := range []struct {
+		updateStrategy *monitoringv1.StatefulSetUpdateStrategy
+		exp            appsv1.StatefulSetUpdateStrategy
+	}{
+		{
+			updateStrategy: nil,
+			exp: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+			},
+		},
+		{
+			updateStrategy: &monitoringv1.StatefulSetUpdateStrategy{
+				Type: monitoringv1.RollingUpdateStatefulSetStrategyType,
+			},
+			exp: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+			},
+		},
+		{
+			updateStrategy: &monitoringv1.StatefulSetUpdateStrategy{
+				Type: monitoringv1.RollingUpdateStatefulSetStrategyType,
+				RollingUpdate: &monitoringv1.RollingUpdateStatefulSetStrategy{
+					MaxUnavailable: new(intstr.FromInt(1)),
+				},
+			},
+			exp: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{
+					MaxUnavailable: new(intstr.FromInt(1)),
+				},
+			},
+		},
+		{
+			updateStrategy: &monitoringv1.StatefulSetUpdateStrategy{
+				Type: monitoringv1.OnDeleteStatefulSetStrategyType,
+			},
+			exp: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
+			},
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			sset, err := makeStatefulSet(&monitoringv1.ThanosRuler{
+				Spec: monitoringv1.ThanosRulerSpec{
+					UpdateStrategy: tc.updateStrategy,
+					QueryEndpoints: emptyQueryEndpoints,
+				},
+			}, defaultTestConfig, nil, "", &operator.ShardedSecret{})
+
+			require.NoError(t, err)
+			require.Equal(t, tc.exp, sset.Spec.UpdateStrategy)
 		})
 	}
 }

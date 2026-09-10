@@ -1,4 +1,4 @@
-// Copyright 2020 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,29 +16,32 @@ package framework
 
 import (
 	"context"
+	"fmt"
 	"time"
 
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	appsv1 "k8s.io/api/apps/v1"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
 )
 
-func (f *Framework) MakeBlackBoxExporterService(ns, name string) *v1.Service {
-	return &v1.Service{
+func (f *Framework) MakeBlackBoxExporterService(ns, name string) *corev1.Service {
+	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: ns,
 		},
-		Spec: v1.ServiceSpec{
-			Type: v1.ServiceTypeClusterIP,
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP,
 			Selector: map[string]string{
-				"app.kubernetes.io/name": "blackbox-exporter",
+				operator.ApplicationNameLabelKey: "blackbox-exporter",
 			},
-			Ports: []v1.ServicePort{
+			Ports: []corev1.ServicePort{
 				{
 					Port:       9115,
 					TargetPort: intstr.FromInt(9115),
@@ -49,7 +52,7 @@ func (f *Framework) MakeBlackBoxExporterService(ns, name string) *v1.Service {
 }
 
 func (f *Framework) createBlackBoxExporterConfigMapAndWaitExists(ctx context.Context, ns, name string) error {
-	cm := &v1.ConfigMap{
+	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: ns,
@@ -87,30 +90,30 @@ func (f *Framework) createBlackBoxExporterDeploymentAndWaitReady(ctx context.Con
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app.kubernetes.io/name": "blackbox-exporter",
+					operator.ApplicationNameLabelKey: "blackbox-exporter",
 				},
 			},
-			Template: v1.PodTemplateSpec{
+			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"app.kubernetes.io/name": "blackbox-exporter",
+						operator.ApplicationNameLabelKey: "blackbox-exporter",
 					},
 				},
-				Spec: v1.PodSpec{
-					Containers: []v1.Container{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
 						{
 							Name:  "blackbox-exporter",
 							Image: "prom/blackbox-exporter:v0.17.0",
 							Args: []string{
 								"--config.file=/config/blackbox.yml",
 							},
-							Ports: []v1.ContainerPort{
+							Ports: []corev1.ContainerPort{
 								{
 									ContainerPort: 9115,
-									Protocol:      v1.ProtocolTCP,
+									Protocol:      corev1.ProtocolTCP,
 								},
 							},
-							VolumeMounts: []v1.VolumeMount{
+							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "config",
 									MountPath: "/config",
@@ -118,12 +121,12 @@ func (f *Framework) createBlackBoxExporterDeploymentAndWaitReady(ctx context.Con
 							},
 						},
 					},
-					Volumes: []v1.Volume{
+					Volumes: []corev1.Volume{
 						{
 							Name: "config",
-							VolumeSource: v1.VolumeSource{
-								ConfigMap: &v1.ConfigMapVolumeSource{
-									LocalObjectReference: v1.LocalObjectReference{
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
 										Name: name,
 									},
 								},
@@ -139,7 +142,7 @@ func (f *Framework) createBlackBoxExporterDeploymentAndWaitReady(ctx context.Con
 		return err
 	}
 
-	return wait.Poll(2*time.Second, f.DefaultTimeout, func() (bool, error) {
+	return wait.PollUntilContextTimeout(ctx, 2*time.Second, f.DefaultTimeout, false, func(ctx context.Context) (bool, error) {
 		blackbox, err := deploymentInterface.Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return false, nil
@@ -185,4 +188,50 @@ func (f *Framework) MakeBasicStaticProbe(name, url string, targets []string) *mo
 			},
 		},
 	}
+}
+
+func (f *Framework) WaitForProbeCondition(ctx context.Context, bm *monitoringv1.Probe, workload metav1.Object, resource string, conditionType monitoringv1.ConditionType, conditionStatus monitoringv1.ConditionStatus, timeout time.Duration) (*monitoringv1.Probe, error) {
+	var current *monitoringv1.Probe
+
+	if err := f.WaitForConfigResourceCondition(
+		ctx,
+		func(ctx context.Context) ([]monitoringv1.WorkloadBinding, error) {
+			var err error
+			current, err = f.MonClientV1.Probes(bm.Namespace).Get(ctx, bm.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			return current.Status.Bindings, nil
+		},
+		workload,
+		resource,
+		conditionType,
+		conditionStatus,
+		timeout,
+	); err != nil {
+		return nil, fmt.Errorf("probe status %v/%v failed to reach expected condition: %w", bm.Namespace, bm.Name, err)
+	}
+	return current, nil
+}
+
+func (f *Framework) WaitForProbeWorkloadBindingCleanup(ctx context.Context, bm *monitoringv1.Probe, workload metav1.Object, resource string, timeout time.Duration) (*monitoringv1.Probe, error) {
+	var current *monitoringv1.Probe
+
+	if err := f.WaitForConfigResWorkloadBindingCleanup(
+		ctx,
+		func(ctx context.Context) ([]monitoringv1.WorkloadBinding, error) {
+			var err error
+			current, err = f.MonClientV1.Probes(bm.Namespace).Get(ctx, bm.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			return current.Status.Bindings, nil
+		},
+		workload,
+		resource,
+		timeout,
+	); err != nil {
+		return nil, fmt.Errorf("probe status %v/%v failed to reach expected condition: %w", bm.Namespace, bm.Name, err)
+	}
+	return current, nil
 }

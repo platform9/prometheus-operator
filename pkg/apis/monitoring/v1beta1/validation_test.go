@@ -1,4 +1,4 @@
-// Copyright 2021 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,11 @@ package v1beta1
 import (
 	"reflect"
 	"testing"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 )
 
 func TestTimeRange_Parse(t *testing.T) {
@@ -97,22 +102,37 @@ func TestMonthRange_Parse(t *testing.T) {
 			expectErr: true,
 		},
 		{
-			name:      "Test invalid months returns error",
+			name:      "Test invalid named months returns error",
 			in:        MonthRange("januarE"),
 			expectErr: true,
 		},
 		{
-			name:      "Test invalid months in range returns error",
+			name:      "Test invalid numerical months returns error",
+			in:        MonthRange("13"),
+			expectErr: true,
+		},
+		{
+			name:      "Test invalid named months in range returns error",
 			in:        MonthRange("january:Merch"),
 			expectErr: true,
 		},
 		{
-			name:      "Test invalid range - end before start returns error",
+			name:      "Test invalid numerical months in range returns error",
+			in:        MonthRange("1:13"),
+			expectErr: true,
+		},
+		{
+			name:      "Test invalid named range - end before start returns error",
 			in:        MonthRange("march:january"),
 			expectErr: true,
 		},
 		{
-			name: "Test happy path",
+			name:      "Test invalid numerical range - end before start returns error",
+			in:        MonthRange("3:1"),
+			expectErr: true,
+		},
+		{
+			name: "Test happy named path",
 			in:   MonthRange("january"),
 			expectResult: &ParsedRange{
 				Start: 1,
@@ -120,8 +140,40 @@ func TestMonthRange_Parse(t *testing.T) {
 			},
 		},
 		{
-			name: "Test happy path range",
+			name: "Test happy one digit numerical path",
+			in:   MonthRange("1"),
+			expectResult: &ParsedRange{
+				Start: 1,
+				End:   1,
+			},
+		},
+		{
+			name: "Test happy two digits numerical path",
+			in:   MonthRange("12"),
+			expectResult: &ParsedRange{
+				Start: 12,
+				End:   12,
+			},
+		},
+		{
+			name: "Test happy named path range",
 			in:   MonthRange("january:march"),
+			expectResult: &ParsedRange{
+				Start: 1,
+				End:   3,
+			},
+		},
+		{
+			name: "Test happy numerical path range",
+			in:   MonthRange("1:12"),
+			expectResult: &ParsedRange{
+				Start: 1,
+				End:   12,
+			},
+		},
+		{
+			name: "Test happy mixed path range",
+			in:   MonthRange("1:march"),
 			expectResult: &ParsedRange{
 				Start: 1,
 				End:   3,
@@ -342,4 +394,125 @@ func TestYearRange_Parse(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHTTPClientConfigValidate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   *HTTPConfig
+		fail bool
+	}{
+		{
+			name: "nil",
+		},
+		{
+			name: "empty",
+			in:   &HTTPConfig{},
+		},
+		{
+			name: "duplicate basic-auth and auth",
+			in: &HTTPConfig{
+				Authorization: &monitoringv1.SafeAuthorization{
+					Credentials: &v1.SecretKeySelector{},
+				},
+				BasicAuth: &monitoringv1.BasicAuth{},
+			},
+			fail: true,
+		},
+		{
+			name: "duplicate basic-auth and oauth2",
+			in: &HTTPConfig{
+				OAuth2:    &monitoringv1.OAuth2{},
+				BasicAuth: &monitoringv1.BasicAuth{},
+			},
+			fail: true,
+		},
+		{
+			name: "invalid Proxy URL",
+			in: &HTTPConfig{
+				ProxyConfig: monitoringv1.ProxyConfig{
+					ProxyURL: ptr.To("://example.com"),
+				},
+			},
+			fail: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+
+			err := tc.in.Validate()
+			if tc.fail {
+				if err == nil {
+					t.Fatal("expecting error, got nil")
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("expecting no error, got %q", err)
+			}
+		})
+	}
+}
+func TestOpsGenieConfigResponder_Validate(t *testing.T) {
+	testCases := []struct {
+		name        string
+		in          *OpsGenieConfigResponder
+		expectedErr bool
+	}{
+		{
+			name: "Test nil ID, Name and Username",
+			in: &OpsGenieConfigResponder{
+				Type: "user",
+			},
+			expectedErr: true,
+		},
+		{
+			name: "Test invalid template string type",
+			in: &OpsGenieConfigResponder{
+				Name: ptr.To("responder"),
+				Type: "{{.GroupLabels",
+			},
+			expectedErr: true,
+		},
+		{
+			name: "Test valid template string type",
+			in: &OpsGenieConfigResponder{
+				Name: ptr.To("responder"),
+				Type: "{{.GroupLabels}}",
+			},
+			expectedErr: false,
+		},
+		{
+			name: "Test invalid type",
+			in: &OpsGenieConfigResponder{
+				Name: ptr.To("responder"),
+				Type: "username",
+			},
+			expectedErr: true,
+		},
+		{
+			name: "Test valid type",
+			in: &OpsGenieConfigResponder{
+				Name: ptr.To("responder"),
+				Type: "user",
+			},
+			expectedErr: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.in.Validate()
+			if tc.expectedErr {
+				if err == nil {
+					t.Fatal("expected err but got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error but got %v", err)
+			}
+		})
+	}
+
 }

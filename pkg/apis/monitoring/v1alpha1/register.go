@@ -1,4 +1,4 @@
-// Copyright 2020 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,6 +51,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&AlertmanagerConfigList{},
 		&PrometheusAgent{},
 		&PrometheusAgentList{},
+		&ScrapeConfig{},
+		&ScrapeConfigList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return nil

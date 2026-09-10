@@ -16,17 +16,32 @@
 
 package v1
 
-// ThanosRulerStatusApplyConfiguration represents an declarative configuration of the ThanosRulerStatus type for use
+// ThanosRulerStatusApplyConfiguration represents a declarative configuration of the ThanosRulerStatus type for use
 // with apply.
+//
+// ThanosRulerStatus is the most recent observed status of the ThanosRuler. Read-only.
+// More info:
+// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
 type ThanosRulerStatusApplyConfiguration struct {
-	Paused              *bool  `json:"paused,omitempty"`
-	Replicas            *int32 `json:"replicas,omitempty"`
-	UpdatedReplicas     *int32 `json:"updatedReplicas,omitempty"`
-	AvailableReplicas   *int32 `json:"availableReplicas,omitempty"`
+	// paused defines whether any actions on the underlying managed objects are
+	// being performed. Only delete actions will be performed.
+	Paused *bool `json:"paused,omitempty"`
+	// replicas defines the total number of non-terminated pods targeted by this ThanosRuler deployment
+	// (their labels match the selector).
+	Replicas *int32 `json:"replicas,omitempty"`
+	// updatedReplicas defines the total number of non-terminated pods targeted by this ThanosRuler deployment
+	// that have the desired version spec.
+	UpdatedReplicas *int32 `json:"updatedReplicas,omitempty"`
+	// availableReplicas defines the total number of available pods (ready for at least minReadySeconds)
+	// targeted by this ThanosRuler deployment.
+	AvailableReplicas *int32 `json:"availableReplicas,omitempty"`
+	// unavailableReplicas defines the total number of unavailable pods targeted by this ThanosRuler deployment.
 	UnavailableReplicas *int32 `json:"unavailableReplicas,omitempty"`
+	// conditions defines the current state of the ThanosRuler object.
+	Conditions []ConditionApplyConfiguration `json:"conditions,omitempty"`
 }
 
-// ThanosRulerStatusApplyConfiguration constructs an declarative configuration of the ThanosRulerStatus type for use with
+// ThanosRulerStatusApplyConfiguration constructs a declarative configuration of the ThanosRulerStatus type for use with
 // apply.
 func ThanosRulerStatus() *ThanosRulerStatusApplyConfiguration {
 	return &ThanosRulerStatusApplyConfiguration{}
@@ -69,5 +84,18 @@ func (b *ThanosRulerStatusApplyConfiguration) WithAvailableReplicas(value int32)
 // If called multiple times, the UnavailableReplicas field is set to the value of the last call.
 func (b *ThanosRulerStatusApplyConfiguration) WithUnavailableReplicas(value int32) *ThanosRulerStatusApplyConfiguration {
 	b.UnavailableReplicas = &value
+	return b
+}
+
+// WithConditions adds the given value to the Conditions field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the Conditions field.
+func (b *ThanosRulerStatusApplyConfiguration) WithConditions(values ...*ConditionApplyConfiguration) *ThanosRulerStatusApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithConditions")
+		}
+		b.Conditions = append(b.Conditions, *values[i])
+	}
 	return b
 }

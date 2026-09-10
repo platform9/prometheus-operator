@@ -1,4 +1,4 @@
-// Copyright 2018 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,10 +23,12 @@ import (
 	_ "github.com/ahmetb/gen-crd-api-reference-docs"
 	_ "github.com/brancz/gojsontoyaml"
 	_ "github.com/bwplotka/mdox"
-	_ "github.com/golangci/golangci-lint/cmd/golangci-lint"
+	_ "github.com/golangci/golangci-lint/v2/cmd/golangci-lint"
 	_ "github.com/google/go-jsonnet/cmd/jsonnet"
 	_ "github.com/google/go-jsonnet/cmd/jsonnetfmt"
 	_ "github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb"
+	_ "github.com/prometheus/prometheus/cmd/promtool"
+	_ "github.com/simonpasquier/metrics-gen"
 	_ "github.com/yeya24/promlinter/cmd/promlinter"
 	_ "k8s.io/code-generator/cmd/applyconfiguration-gen"
 	_ "k8s.io/code-generator/cmd/client-gen"

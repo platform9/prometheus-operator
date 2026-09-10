@@ -16,23 +16,49 @@
 
 package v1beta1
 
-// ReceiverApplyConfiguration represents an declarative configuration of the Receiver type for use
+// ReceiverApplyConfiguration represents a declarative configuration of the Receiver type for use
 // with apply.
+//
+// Receiver defines one or more notification integrations.
 type ReceiverApplyConfiguration struct {
-	Name             *string                             `json:"name,omitempty"`
-	OpsGenieConfigs  []OpsGenieConfigApplyConfiguration  `json:"opsgenieConfigs,omitempty"`
+	// name defines the name of the receiver. Must be unique across all items from the list.
+	Name *string `json:"name,omitempty"`
+	// opsgenieConfigs defines the list of OpsGenie configurations.
+	OpsGenieConfigs []OpsGenieConfigApplyConfiguration `json:"opsgenieConfigs,omitempty"`
+	// pagerdutyConfigs defines the List of PagerDuty configurations.
 	PagerDutyConfigs []PagerDutyConfigApplyConfiguration `json:"pagerdutyConfigs,omitempty"`
-	SlackConfigs     []SlackConfigApplyConfiguration     `json:"slackConfigs,omitempty"`
-	WebhookConfigs   []WebhookConfigApplyConfiguration   `json:"webhookConfigs,omitempty"`
-	WeChatConfigs    []WeChatConfigApplyConfiguration    `json:"wechatConfigs,omitempty"`
-	EmailConfigs     []EmailConfigApplyConfiguration     `json:"emailConfigs,omitempty"`
+	// discordConfigs defines the list of Discord configurations.
+	DiscordConfigs []DiscordConfigApplyConfiguration `json:"discordConfigs,omitempty"`
+	// slackConfigs defines the list of Slack configurations.
+	SlackConfigs []SlackConfigApplyConfiguration `json:"slackConfigs,omitempty"`
+	// webhookConfigs defines the List of webhook configurations.
+	WebhookConfigs []WebhookConfigApplyConfiguration `json:"webhookConfigs,omitempty"`
+	// wechatConfigs defines the list of WeChat configurations.
+	WeChatConfigs []WeChatConfigApplyConfiguration `json:"wechatConfigs,omitempty"`
+	// emailConfigs defines the list of Email configurations.
+	EmailConfigs []EmailConfigApplyConfiguration `json:"emailConfigs,omitempty"`
+	// victoropsConfigs defines the list of VictorOps configurations.
 	VictorOpsConfigs []VictorOpsConfigApplyConfiguration `json:"victoropsConfigs,omitempty"`
-	PushoverConfigs  []PushoverConfigApplyConfiguration  `json:"pushoverConfigs,omitempty"`
-	SNSConfigs       []SNSConfigApplyConfiguration       `json:"snsConfigs,omitempty"`
-	TelegramConfigs  []TelegramConfigApplyConfiguration  `json:"telegramConfigs,omitempty"`
+	// pushoverConfigs defines the list of Pushover configurations.
+	PushoverConfigs []PushoverConfigApplyConfiguration `json:"pushoverConfigs,omitempty"`
+	// snsConfigs defines the list of SNS configurations
+	SNSConfigs []SNSConfigApplyConfiguration `json:"snsConfigs,omitempty"`
+	// telegramConfigs defines the list of Telegram configurations.
+	TelegramConfigs []TelegramConfigApplyConfiguration `json:"telegramConfigs,omitempty"`
+	// webexConfigs defines the list of Webex configurations.
+	WebexConfigs []WebexConfigApplyConfiguration `json:"webexConfigs,omitempty"`
+	// msteamsConfigs defines the list of MSTeams configurations.
+	// It requires Alertmanager >= 0.26.0.
+	MSTeamsConfigs []MSTeamsConfigApplyConfiguration `json:"msteamsConfigs,omitempty"`
+	// msteamsv2Configs defines the list of MSTeamsV2 configurations.
+	// It requires Alertmanager >= 0.28.0.
+	MSTeamsV2Configs []MSTeamsV2ConfigApplyConfiguration `json:"msteamsv2Configs,omitempty"`
+	// rocketchatConfigs defines the list of RocketChat configurations.
+	// It requires Alertmanager >= 0.28.0.
+	RocketChatConfigs []RocketChatConfigApplyConfiguration `json:"rocketchatConfigs,omitempty"`
 }
 
-// ReceiverApplyConfiguration constructs an declarative configuration of the Receiver type for use with
+// ReceiverApplyConfiguration constructs a declarative configuration of the Receiver type for use with
 // apply.
 func Receiver() *ReceiverApplyConfiguration {
 	return &ReceiverApplyConfiguration{}
@@ -68,6 +94,19 @@ func (b *ReceiverApplyConfiguration) WithPagerDutyConfigs(values ...*PagerDutyCo
 			panic("nil value passed to WithPagerDutyConfigs")
 		}
 		b.PagerDutyConfigs = append(b.PagerDutyConfigs, *values[i])
+	}
+	return b
+}
+
+// WithDiscordConfigs adds the given value to the DiscordConfigs field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the DiscordConfigs field.
+func (b *ReceiverApplyConfiguration) WithDiscordConfigs(values ...*DiscordConfigApplyConfiguration) *ReceiverApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithDiscordConfigs")
+		}
+		b.DiscordConfigs = append(b.DiscordConfigs, *values[i])
 	}
 	return b
 }
@@ -172,6 +211,58 @@ func (b *ReceiverApplyConfiguration) WithTelegramConfigs(values ...*TelegramConf
 			panic("nil value passed to WithTelegramConfigs")
 		}
 		b.TelegramConfigs = append(b.TelegramConfigs, *values[i])
+	}
+	return b
+}
+
+// WithWebexConfigs adds the given value to the WebexConfigs field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the WebexConfigs field.
+func (b *ReceiverApplyConfiguration) WithWebexConfigs(values ...*WebexConfigApplyConfiguration) *ReceiverApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithWebexConfigs")
+		}
+		b.WebexConfigs = append(b.WebexConfigs, *values[i])
+	}
+	return b
+}
+
+// WithMSTeamsConfigs adds the given value to the MSTeamsConfigs field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the MSTeamsConfigs field.
+func (b *ReceiverApplyConfiguration) WithMSTeamsConfigs(values ...*MSTeamsConfigApplyConfiguration) *ReceiverApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithMSTeamsConfigs")
+		}
+		b.MSTeamsConfigs = append(b.MSTeamsConfigs, *values[i])
+	}
+	return b
+}
+
+// WithMSTeamsV2Configs adds the given value to the MSTeamsV2Configs field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the MSTeamsV2Configs field.
+func (b *ReceiverApplyConfiguration) WithMSTeamsV2Configs(values ...*MSTeamsV2ConfigApplyConfiguration) *ReceiverApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithMSTeamsV2Configs")
+		}
+		b.MSTeamsV2Configs = append(b.MSTeamsV2Configs, *values[i])
+	}
+	return b
+}
+
+// WithRocketChatConfigs adds the given value to the RocketChatConfigs field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the RocketChatConfigs field.
+func (b *ReceiverApplyConfiguration) WithRocketChatConfigs(values ...*RocketChatConfigApplyConfiguration) *ReceiverApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithRocketChatConfigs")
+		}
+		b.RocketChatConfigs = append(b.RocketChatConfigs, *values[i])
 	}
 	return b
 }

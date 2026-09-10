@@ -1,4 +1,4 @@
-// Copyright 2021 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,22 +15,22 @@
 package operator
 
 import (
-	"github.com/alecthomas/units"
+	"github.com/blang/semver/v4"
 	"github.com/prometheus/common/model"
 )
 
-func ValidateSizeField(sizeField string) error {
-	// To validate if given value is parsable for the acceptable size values
-	if _, err := units.ParseBase2Bytes(sizeField); err != nil {
-		return err
+// ValidationSchemeForPrometheus returns the appropriate validation scheme based on Prometheus version.
+func ValidationSchemeForPrometheus(version semver.Version) model.ValidationScheme {
+	if version.GTE(semver.MustParse("3.0.0")) {
+		return model.UTF8Validation
 	}
-	return nil
+	return model.LegacyValidation
 }
 
-func ValidateDurationField(durationField string) error {
-	// To validate if given value is parsable for the acceptable duration values
-	if _, err := model.ParseDuration(durationField); err != nil {
-		return err
+// ValidationSchemeForThanos returns the appropriate validation scheme based on Thanos version.
+func ValidationSchemeForThanos(version semver.Version) model.ValidationScheme {
+	if version.GTE(semver.MustParse("0.38.0")) {
+		return model.UTF8Validation
 	}
-	return nil
+	return model.LegacyValidation
 }

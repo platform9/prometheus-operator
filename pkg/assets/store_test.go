@@ -1,4 +1,4 @@
-// Copyright 2020 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,11 +16,10 @@ package assets
 
 import (
 	"context"
-	"fmt"
-	"reflect"
 	"testing"
 
-	v1 "k8s.io/api/core/v1"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -65,9 +64,9 @@ hvBlhCknnq89u57O41ID6Mqxz3bRxNxpkqhfMyVWcVU=
 -----END RSA PRIVATE KEY-----`
 )
 
-func TestAddBearerToken(t *testing.T) {
-	c := fake.NewSimpleClientset(
-		&v1.Secret{
+func TestGetSecretKey(t *testing.T) {
+	c := fake.NewClientset(
+		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "secret",
 				Namespace: "ns1",
@@ -78,7 +77,7 @@ func TestAddBearerToken(t *testing.T) {
 		},
 	)
 
-	for i, tc := range []struct {
+	for _, tc := range []struct {
 		ns           string
 		selectedName string
 		selectedKey  string
@@ -119,45 +118,32 @@ func TestAddBearerToken(t *testing.T) {
 		},
 	} {
 		t.Run("", func(t *testing.T) {
-			store := NewStore(c.CoreV1(), c.CoreV1())
+			store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
 
-			sel := v1.SecretKeySelector{
-				LocalObjectReference: v1.LocalObjectReference{
+			sel := corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{
 					Name: tc.selectedName,
 				},
 				Key: tc.selectedKey,
 			}
 
-			key := fmt.Sprintf("bearertoken/%d", i)
-			err := store.AddBearerToken(context.Background(), tc.ns, sel, key)
+			s, err := store.GetSecretKey(context.Background(), tc.ns, sel)
 
 			if tc.err {
-				if err == nil {
-					t.Fatal("expecting error, got no error")
-				}
+				require.Error(t, err)
 				return
 			}
 
-			if err != nil {
-				t.Fatalf("expecting no error, got %q", err)
-			}
+			require.NoError(t, err)
 
-			s, found := store.TokenAssets[key]
-
-			if !found {
-				t.Fatalf("expecting to find key %q but got nothing", key)
-			}
-
-			if string(s) != tc.expected {
-				t.Fatalf("expecting %q, got %q", tc.expected, s)
-			}
+			require.Equal(t, tc.expected, s, "expecting %q, got %q", tc.expected, s)
 		})
 	}
 }
 
 func TestAddBasicAuth(t *testing.T) {
-	c := fake.NewSimpleClientset(
-		&v1.Secret{
+	c := fake.NewClientset(
+		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "secret",
 				Namespace: "ns1",
@@ -169,7 +155,7 @@ func TestAddBasicAuth(t *testing.T) {
 		},
 	)
 
-	for i, tc := range []struct {
+	for _, tc := range []struct {
 		ns                   string
 		selectedUserName     string
 		selectedUserKey      string
@@ -242,56 +228,137 @@ func TestAddBasicAuth(t *testing.T) {
 		},
 	} {
 		t.Run("", func(t *testing.T) {
-			store := NewStore(c.CoreV1(), c.CoreV1())
+			store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
 
 			basicAuth := &monitoringv1.BasicAuth{
-				Username: v1.SecretKeySelector{
-					LocalObjectReference: v1.LocalObjectReference{
+				Username: corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
 						Name: tc.selectedUserName,
 					},
 					Key: tc.selectedUserKey,
 				},
-				Password: v1.SecretKeySelector{
-					LocalObjectReference: v1.LocalObjectReference{
+				Password: corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
 						Name: tc.selectedPasswordName,
 					},
 					Key: tc.selectedPasswordKey,
 				},
 			}
 
-			key := fmt.Sprintf("basicauth/%d", i)
-			err := store.AddBasicAuth(context.Background(), tc.ns, basicAuth, key)
+			err := store.AddBasicAuth(context.Background(), tc.ns, basicAuth)
 
 			if tc.err {
-				if err == nil {
-					t.Fatal("expecting error, got no error")
-				}
+				require.Error(t, err)
 				return
 			}
 
-			if err != nil {
-				t.Fatalf("expecting no error, got %q", err)
-			}
+			require.NoError(t, err)
 
-			s, found := store.BasicAuthAssets[key]
+			b, err := store.ForNamespace(tc.ns).GetSecretKey(basicAuth.Password)
+			require.NoError(t, err)
 
-			if !found {
-				t.Fatalf("expecting to find key %q but got nothing", key)
-			}
+			require.Equal(t, tc.expectedPassword, string(b), "expecting password value %q, got %q", tc.expectedPassword, string(b))
 
-			if s.Username != tc.expectedUser {
-				t.Fatalf("expecting username %q, got %q", tc.expectedUser, s)
-			}
-			if s.Password != tc.expectedPassword {
-				t.Fatalf("expecting password %q, got %q", tc.expectedPassword, s)
-			}
+			b, err = store.ForNamespace(tc.ns).GetSecretKey(basicAuth.Username)
+			require.NoError(t, err)
+
+			require.Equal(t, tc.expectedUser, string(b), "expecting username value %q, got %q", tc.expectedUser, string(b))
 		})
 	}
 }
 
+func TestProxyCongfig(t *testing.T) {
+	c := fake.NewClientset(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret",
+				Namespace: "ns1",
+			},
+			Data: map[string][]byte{
+				"proxyA": []byte("proxyA"),
+				"proxyB": []byte("proxyB"),
+				"proxyC": []byte("proxyC"),
+			},
+		},
+	)
+
+	for _, tc := range []struct {
+		ns            string
+		selectedName  string
+		selectedKey   string
+		selectedValue string
+
+		err bool
+	}{
+		{
+			ns:            "ns1",
+			selectedName:  "secret",
+			selectedKey:   "proxyA",
+			selectedValue: "proxyA",
+			err:           false,
+		},
+		{
+			// Wrong selected name.
+			ns:            "ns1",
+			selectedName:  "proxyA",
+			selectedKey:   "proxyA",
+			selectedValue: "proxyA",
+			err:           true,
+		},
+		{
+			// Wrong namespace.
+			ns:            "ns2",
+			selectedName:  "secret",
+			selectedKey:   "proxyA",
+			selectedValue: "proxyA",
+			err:           true,
+		},
+		{
+			// Wrong not found selected key.
+			ns:            "ns1",
+			selectedName:  "secret",
+			selectedKey:   "proxyD",
+			selectedValue: "proxyD",
+			err:           true,
+		},
+	} {
+
+		t.Run("", func(t *testing.T) {
+			store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
+
+			proxyConfig := monitoringv1.ProxyConfig{
+				ProxyConnectHeader: map[string][]corev1.SecretKeySelector{
+					"header": {
+						{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: tc.selectedName,
+							},
+							Key: tc.selectedKey,
+						},
+					},
+				},
+			}
+
+			err := store.AddProxyConfig(context.Background(), tc.ns, proxyConfig)
+
+			if tc.err {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+
+			b, err := store.ForNamespace(tc.ns).GetSecretKey(proxyConfig.ProxyConnectHeader["header"][0])
+			require.NoError(t, err)
+			require.Equal(t, tc.selectedValue, string(b))
+		})
+	}
+
+}
+
 func TestAddTLSConfig(t *testing.T) {
-	c := fake.NewSimpleClientset(
-		&v1.ConfigMap{
+	c := fake.NewClientset(
+		&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "cm",
 				Namespace: "ns1",
@@ -302,7 +369,7 @@ func TestAddTLSConfig(t *testing.T) {
 				"cmKey":  keyPEM,
 			},
 		},
-		&v1.Secret{
+		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "secret",
 				Namespace: "ns1",
@@ -333,23 +400,23 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "secretCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "secretCert",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "secretKey",
@@ -367,23 +434,23 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						ConfigMap: &v1.ConfigMapKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						ConfigMap: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "cm",
 							},
 							Key: "cmCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "secretCert",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "secretKey",
@@ -401,23 +468,23 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						ConfigMap: &v1.ConfigMapKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						ConfigMap: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "cm",
 							},
 							Key: "cmCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						ConfigMap: &v1.ConfigMapKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						ConfigMap: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "cm",
 							},
 							Key: "cmCert",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "secretKey",
@@ -435,23 +502,23 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						ConfigMap: &v1.ConfigMapKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						ConfigMap: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "cm",
 							},
 							Key: "cmCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						ConfigMap: &v1.ConfigMapKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						ConfigMap: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "cm",
 							},
 							Key: "cmCert",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "secretKey",
@@ -467,23 +534,23 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						ConfigMap: &v1.ConfigMapKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						ConfigMap: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "cm",
 							},
 							Key: "secretCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						ConfigMap: &v1.ConfigMapKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						ConfigMap: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "cm",
 							},
 							Key: "cmCert",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "secretKey",
@@ -499,23 +566,23 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "cmCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						ConfigMap: &v1.ConfigMapKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						ConfigMap: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "cm",
 							},
 							Key: "cmCert",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "secretKey",
@@ -531,23 +598,23 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						ConfigMap: &v1.ConfigMapKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						ConfigMap: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "cm",
 							},
 							Key: "cmCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						ConfigMap: &v1.ConfigMapKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						ConfigMap: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "cm",
 							},
 							Key: "secretCert",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "secretKey",
@@ -563,23 +630,23 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						ConfigMap: &v1.ConfigMapKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						ConfigMap: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "cm",
 							},
 							Key: "cmCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "cmCert",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "secretKey",
@@ -595,23 +662,23 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "secretCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "secretCert",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "cmKey",
@@ -627,16 +694,16 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "secretCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "secretCert",
@@ -653,15 +720,15 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "secretCA",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "secretKey",
@@ -677,23 +744,23 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "secretCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "secretCert",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "wrongKey",
@@ -709,23 +776,23 @@ func TestAddTLSConfig(t *testing.T) {
 			tlsConfig: &monitoringv1.TLSConfig{
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
 					CA: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "invalidCA",
 						},
 					},
 					Cert: monitoringv1.SecretOrConfigMap{
-						Secret: &v1.SecretKeySelector{
-							LocalObjectReference: v1.LocalObjectReference{
+						Secret: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
 								Name: "secret",
 							},
 							Key: "secretCert",
 						},
 					},
-					KeySecret: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					KeySecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: "secret",
 						},
 						Key: "secretKey",
@@ -737,57 +804,38 @@ func TestAddTLSConfig(t *testing.T) {
 		},
 	} {
 		t.Run("", func(t *testing.T) {
-			store := NewStore(c.CoreV1(), c.CoreV1())
+			store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
 
 			err := store.AddSafeTLSConfig(context.Background(), tc.ns, &tc.tlsConfig.SafeTLSConfig)
-
 			if tc.err {
-				if err == nil {
-					t.Fatal("expecting error, got no error")
-				}
+				require.Error(t, err)
 				return
 			}
+			require.NoError(t, err)
 
-			if err != nil {
-				t.Fatalf("expecting no error, got %q", err)
-			}
+			tlsAssets := store.TLSAssets()
 
-			key := TLSAssetKeyFromSelector(tc.ns, tc.tlsConfig.CA)
+			key := tlsAssetKeyFromSelector(tc.ns, tc.tlsConfig.CA).toString()
+			b, found := tlsAssets[key]
+			require.True(t, found)
+			require.Equal(t, tc.expectedCA, string(b))
 
-			ca, found := store.TLSAssets[key]
-			if !found {
-				t.Fatalf("expecting to find key %q but got nothing", key)
-			}
-			if string(ca) != tc.expectedCA {
-				t.Fatalf("expecting CA %q, got %q", tc.expectedCA, ca)
-			}
+			key = tlsAssetKeyFromSelector(tc.ns, tc.tlsConfig.Cert).toString()
+			b, found = tlsAssets[key]
+			require.True(t, found)
+			require.Equal(t, tc.expectedCert, string(b))
 
-			key = TLSAssetKeyFromSelector(tc.ns, tc.tlsConfig.Cert)
-
-			cert, found := store.TLSAssets[key]
-			if !found {
-				t.Fatalf("expecting to find key %q but got nothing", key)
-			}
-			if string(cert) != tc.expectedCert {
-				t.Fatalf("expecting cert %q, got %q", tc.expectedCert, cert)
-			}
-
-			key = TLSAssetKeyFromSecretSelector(tc.ns, tc.tlsConfig.KeySecret)
-
-			k, found := store.TLSAssets[key]
-			if !found {
-				t.Fatalf("expecting to find key %q but got nothing", key)
-			}
-			if string(k) != tc.expectedKey {
-				t.Fatalf("expecting cert key %q, got %q", tc.expectedCert, k)
-			}
+			key = tlsAssetKeyFromSecretSelector(tc.ns, tc.tlsConfig.KeySecret).toString()
+			b, found = tlsAssets[key]
+			require.True(t, found)
+			require.Equal(t, tc.expectedKey, string(b))
 		})
 	}
 }
 
 func TestAddAuthorization(t *testing.T) {
-	c := fake.NewSimpleClientset(
-		&v1.Secret{
+	c := fake.NewClientset(
+		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "secret",
 				Namespace: "ns1",
@@ -798,7 +846,7 @@ func TestAddAuthorization(t *testing.T) {
 		},
 	)
 
-	for i, tc := range []struct {
+	for _, tc := range []struct {
 		ns           string
 		selectedName string
 		selectedKey  string
@@ -831,52 +879,54 @@ func TestAddAuthorization(t *testing.T) {
 
 			err: true,
 		},
+		{
+			ns:           "ns1",
+			selectedName: "",
+			selectedKey:  "",
+			authType:     "Bearer",
+
+			expected: "",
+		},
 	} {
 		t.Run("", func(t *testing.T) {
-			store := NewStore(c.CoreV1(), c.CoreV1())
+			store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
 
 			sel := &monitoringv1.Authorization{
 				SafeAuthorization: monitoringv1.SafeAuthorization{
 					Type: tc.authType,
-					Credentials: &v1.SecretKeySelector{
-						LocalObjectReference: v1.LocalObjectReference{
+					Credentials: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: tc.selectedName},
 						Key: tc.selectedKey,
 					},
 				},
 			}
 
-			key := fmt.Sprintf("foo/auth/%d", i)
-			err := store.AddAuthorizationCredentials(context.Background(), tc.ns, sel, key)
+			err := store.AddAuthorizationCredentials(context.Background(), tc.ns, sel)
 
 			if tc.err {
-				if err == nil {
-					t.Fatal("expecting error, got no error")
-				}
+				require.Error(t, err)
 				return
 			}
 
-			if err != nil {
-				t.Fatalf("expecting no error, got %q", err)
+			require.NoError(t, err)
+
+			if sel.Credentials.Name == "" {
+				return
 			}
 
-			sec, found := store.TokenAssets[key]
+			b, err := store.ForNamespace(tc.ns).GetSecretKey(*sel.Credentials)
+			require.NoError(t, err)
 
-			if !found {
-				t.Fatalf("expecting to find key %q but got nothing", key)
-			}
-
-			s := string(sec)
-			if s != tc.expected {
-				t.Fatalf("expecting %q, got %q", tc.expected, s)
-			}
+			s := string(b)
+			require.Equal(t, tc.expected, s, "expecting %q, got %q", tc.expected, s)
 		})
 	}
 }
 
 func TestAddAuthorizationNoCredentials(t *testing.T) {
-	c := fake.NewSimpleClientset(
-		&v1.Secret{
+	c := fake.NewClientset(
+		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "secret",
 				Namespace: "ns1",
@@ -888,7 +938,7 @@ func TestAddAuthorizationNoCredentials(t *testing.T) {
 	)
 
 	t.Run("", func(t *testing.T) {
-		store := NewStore(c.CoreV1(), c.CoreV1())
+		store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
 
 		sel := &monitoringv1.Authorization{
 			SafeAuthorization: monitoringv1.SafeAuthorization{
@@ -897,11 +947,8 @@ func TestAddAuthorizationNoCredentials(t *testing.T) {
 			CredentialsFile: "/path/to/secret",
 		}
 
-		err := store.AddAuthorizationCredentials(context.Background(), "foo", sel, "foo/bar")
-
-		if err != nil {
-			t.Fatalf("expecting no error, got %q", err)
-		}
+		err := store.AddAuthorizationCredentials(context.Background(), "foo", sel)
+		require.NoError(t, err)
 	})
 }
 
@@ -910,8 +957,8 @@ func TestAddSigV4(t *testing.T) {
 		accessKey = "accessKey"
 		secretKey = "secretKey"
 	)
-	c := fake.NewSimpleClientset(
-		&v1.Secret{
+	c := fake.NewClientset(
+		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "secret",
 				Namespace: "ns1",
@@ -923,14 +970,15 @@ func TestAddSigV4(t *testing.T) {
 		},
 	)
 
-	for i, tc := range []struct {
+	for _, tc := range []struct {
 		title                string
 		ns                   string
 		selectedName         string
 		accessKey, secretKey string
 
-		err      bool
-		expected *SigV4Credentials
+		err                 bool
+		expectedAccessKeyID string
+		expectedSecretKeyID string
 	}{
 		{
 			title:        "valid access and secret keys",
@@ -939,7 +987,8 @@ func TestAddSigV4(t *testing.T) {
 			accessKey:    accessKey,
 			secretKey:    secretKey,
 
-			expected: &SigV4Credentials{AccessKeyID: "val1", SecretKeyID: "val2"},
+			expectedAccessKeyID: "val1",
+			expectedSecretKeyID: "val2",
 		},
 		{
 			title:        "wrong namespace",
@@ -991,51 +1040,435 @@ func TestAddSigV4(t *testing.T) {
 		},
 	} {
 		t.Run("", func(t *testing.T) {
-			store := NewStore(c.CoreV1(), c.CoreV1())
+			store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
 
-			key := fmt.Sprintf("remoteWrite/%d", i)
 			sigV4 := monitoringv1.Sigv4{}
 			if tc.accessKey != "" {
-				sigV4.AccessKey = &v1.SecretKeySelector{
-					LocalObjectReference: v1.LocalObjectReference{
+				sigV4.AccessKey = &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
 						Name: tc.selectedName,
 					},
 					Key: tc.accessKey,
 				}
 			}
 			if tc.secretKey != "" {
-				sigV4.SecretKey = &v1.SecretKeySelector{
-					LocalObjectReference: v1.LocalObjectReference{
+				sigV4.SecretKey = &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
 						Name: tc.selectedName,
 					},
 					Key: tc.secretKey,
 				}
 			}
-			err := store.AddSigV4(context.Background(), tc.ns, &sigV4, key)
 
+			err := store.AddSigV4(context.Background(), tc.ns, &sigV4)
 			if tc.err {
-				if err == nil {
-					t.Fatal("expecting error, got no error")
-				}
+				require.Error(t, err)
 				return
 			}
 
-			if err != nil {
-				t.Fatalf("expecting no error, got %q", err)
+			require.NoError(t, err)
+
+			if sigV4.AccessKey != nil {
+				b, err := store.ForNamespace(tc.ns).GetSecretKey(*sigV4.AccessKey)
+				require.NoError(t, err)
+				require.Equal(t, tc.expectedAccessKeyID, string(b))
 			}
 
-			sigV4Creds, found := store.SigV4Assets[key]
-
-			if !found {
-				if tc.expected != nil {
-					t.Fatalf("expecting to find key %q but got nothing", key)
-				}
-				return
-			}
-
-			if !reflect.DeepEqual(&sigV4Creds, tc.expected) {
-				t.Fatalf("expecting %#v, got %#v", tc.expected, &sigV4Creds)
+			if sigV4.SecretKey != nil {
+				b, err := store.ForNamespace(tc.ns).GetSecretKey(*sigV4.SecretKey)
+				require.NoError(t, err)
+				require.Equal(t, tc.expectedSecretKeyID, string(b))
 			}
 		})
 	}
+}
+
+func TestAddAzureOAuth(t *testing.T) {
+	const (
+		clientSecret = "clientSecretKey"
+	)
+	c := fake.NewClientset(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret",
+				Namespace: "ns1",
+			},
+			Data: map[string][]byte{
+				clientSecret: []byte("val1"),
+			},
+		},
+	)
+
+	for _, tc := range []struct {
+		title                string
+		ns                   string
+		selectedName         string
+		accessKey, secretKey string
+
+		err      bool
+		expected string
+	}{
+		{
+			title:        "valid clientSecret key",
+			ns:           "ns1",
+			selectedName: "secret",
+			secretKey:    clientSecret,
+
+			expected: "val1",
+		},
+		{
+			title:        "wrong namespace",
+			ns:           "ns2",
+			selectedName: "secret",
+			secretKey:    clientSecret,
+
+			err: true,
+		},
+		{
+			title:        "wrong name",
+			ns:           "ns1",
+			selectedName: "faulty",
+			secretKey:    clientSecret,
+
+			err: true,
+		},
+		{
+			title:        "wrong key selector",
+			ns:           "ns1",
+			selectedName: "secret",
+			secretKey:    "wrong-secret-key",
+
+			err: true,
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
+
+			azureAD := monitoringv1.AzureAD{}
+			azureOAuth := monitoringv1.AzureOAuth{}
+			if tc.secretKey != "" {
+				azureOAuth.ClientSecret = corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: tc.selectedName,
+					},
+					Key: tc.secretKey,
+				}
+			}
+			azureAD.OAuth = &azureOAuth
+
+			err := store.AddAzureOAuth(context.Background(), tc.ns, &azureAD)
+			if tc.err {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+
+			b, err := store.ForNamespace(tc.ns).GetSecretKey(azureOAuth.ClientSecret)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, string(b))
+		})
+	}
+}
+
+func TestUpdateObject(t *testing.T) {
+	c := fake.NewClientset(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret",
+				Namespace: "ns1",
+			},
+			Data: map[string][]byte{
+				"key1": []byte("val1"),
+			},
+		},
+	)
+	store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
+
+	// Add the secret to the store by fetching it
+	sel := corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{
+			Name: "secret",
+		},
+		Key: "key1",
+	}
+	val, err := store.GetSecretKey(context.Background(), "ns1", sel)
+	require.NoError(t, err)
+	require.Equal(t, "val1", val)
+
+	// Update the secret object
+	updatedSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "secret",
+			Namespace: "ns1",
+		},
+		Data: map[string][]byte{
+			"key1": []byte("val2"),
+		},
+	}
+	err = store.UpdateObject(updatedSecret)
+	require.NoError(t, err)
+
+	// Now, getting the key should return the updated value
+	val, err = store.GetSecretKey(context.Background(), "ns1", sel)
+	require.NoError(t, err)
+	require.Equal(t, "val2", val)
+
+	// Test updating with nil object
+	err = store.UpdateObject(nil)
+	require.Error(t, err)
+}
+
+func TestDeleteObject(t *testing.T) {
+	c := fake.NewClientset(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret",
+				Namespace: "ns1",
+			},
+			Data: map[string][]byte{
+				"key1": []byte("val1"),
+			},
+		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "cm",
+				Namespace: "ns1",
+			},
+			Data: map[string]string{
+				"cmKey": "cmVal",
+			},
+		},
+	)
+	store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
+
+	// Add secret and configmap to the store by fetching them
+	secretSel := corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{
+			Name: "secret",
+		},
+		Key: "key1",
+	}
+	val, err := store.GetSecretKey(context.Background(), "ns1", secretSel)
+	require.NoError(t, err)
+	require.Equal(t, "val1", val)
+
+	cmSel := corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{
+			Name: "cm",
+		},
+		Key: "cmKey",
+	}
+	_, err = store.GetConfigMapKey(context.Background(), "ns1", cmSel)
+	require.NoError(t, err)
+
+	// Try deleting the secret object
+	secretObj := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "secret",
+			Namespace: "ns1",
+		},
+	}
+	err = store.DeleteObject(secretObj)
+	require.NoError(t, err)
+
+	// Also delete the secret from the fake clientset to simulate full removal
+	err = c.CoreV1().Secrets("ns1").Delete(context.Background(), "secret", metav1.DeleteOptions{})
+	require.NoError(t, err)
+
+	// Now, getting the key should fail since the secret is deleted from the store
+	_, err = store.GetSecretKey(context.Background(), "ns1", secretSel)
+	require.Error(t, err)
+
+	// Try deleting the configmap object (should not error even if it doesn't exist in the client)
+	cmObj := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cm",
+			Namespace: "ns1",
+		},
+	}
+	err = store.DeleteObject(cmObj)
+	require.NoError(t, err)
+
+	err = c.CoreV1().ConfigMaps("ns1").Delete(context.Background(), "cm", metav1.DeleteOptions{})
+	require.NoError(t, err)
+
+	// Now, getting the key should fail since the configmap is deleted from the store
+	_, err = store.GetConfigMapKey(context.Background(), "ns1", cmSel)
+	require.Error(t, err)
+
+	// Test deleting with nil object
+	err = store.DeleteObject(nil)
+	require.Error(t, err)
+}
+
+func TestGetObject(t *testing.T) {
+	c := fake.NewClientset(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret",
+				Namespace: "ns1",
+			},
+			Data: map[string][]byte{
+				"key1": []byte("val1"),
+			},
+		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "cm",
+				Namespace: "ns1",
+			},
+			Data: map[string]string{
+				"cmKey": "cmVal",
+			},
+		},
+	)
+	store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
+
+	// Add secret and configmap to the store by fetching them
+	secretSel := corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{
+			Name: "secret",
+		},
+		Key: "key1",
+	}
+	_, err := store.GetSecretKey(context.Background(), "ns1", secretSel)
+	require.NoError(t, err)
+
+	cmSel := corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{
+			Name: "cm",
+		},
+		Key: "cmKey",
+	}
+	_, err = store.GetConfigMapKey(context.Background(), "ns1", cmSel)
+	require.NoError(t, err)
+
+	// Test getting existing secret
+	secretObj := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "secret",
+			Namespace: "ns1",
+		},
+	}
+	obj, exists, err := store.GetObject(secretObj)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.NotNil(t, obj)
+	secret, ok := obj.(*corev1.Secret)
+	require.True(t, ok)
+	require.Equal(t, "secret", secret.Name)
+	require.Equal(t, "ns1", secret.Namespace)
+	require.Equal(t, []byte("val1"), secret.Data["key1"])
+
+	// Test getting existing configmap
+	cmObj := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cm",
+			Namespace: "ns1",
+		},
+	}
+	obj, exists, err = store.GetObject(cmObj)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.NotNil(t, obj)
+	cm, ok := obj.(*corev1.ConfigMap)
+	require.True(t, ok)
+	require.Equal(t, "cm", cm.Name)
+	require.Equal(t, "ns1", cm.Namespace)
+	require.Equal(t, "cmVal", cm.Data["cmKey"])
+
+	// Test getting non-existing object
+	nonExistingSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "notfound",
+			Namespace: "ns1",
+		},
+	}
+	obj, exists, err = store.GetObject(nonExistingSecret)
+	require.NoError(t, err)
+	require.False(t, exists)
+	require.Nil(t, obj)
+
+	// Test getting with nil object
+	obj, exists, err = store.GetObject(nil)
+	require.Error(t, err)
+	require.False(t, exists)
+	require.Nil(t, obj)
+}
+
+func TestAddObject(t *testing.T) {
+	c := fake.NewClientset(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret",
+				Namespace: "ns1",
+			},
+			Data: map[string][]byte{
+				"key1": []byte("val1"),
+			},
+		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "cm",
+				Namespace: "ns1",
+			},
+			Data: map[string]string{
+				"cmKey": "cmVal",
+			},
+		},
+	)
+	store := NewStoreBuilder(c.CoreV1(), c.CoreV1())
+
+	// Add a secret object
+	secretObj := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "secret2",
+			Namespace: "ns1",
+		},
+		Data: map[string][]byte{
+			"key2": []byte("val2"),
+		},
+	}
+	err := store.AddObject(secretObj)
+	require.NoError(t, err)
+
+	// Retrieve the secret object
+	obj, exists, err := store.GetObject(secretObj)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.NotNil(t, obj)
+	secret, ok := obj.(*corev1.Secret)
+	require.True(t, ok)
+	require.Equal(t, "secret2", secret.Name)
+	require.Equal(t, "ns1", secret.Namespace)
+	require.Equal(t, []byte("val2"), secret.Data["key2"])
+
+	// Add a configmap object
+	cmObj := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cm2",
+			Namespace: "ns1",
+		},
+		Data: map[string]string{
+			"cmKey2": "cmVal2",
+		},
+	}
+	err = store.AddObject(cmObj)
+	require.NoError(t, err)
+
+	// Retrieve the configmap object
+	obj, exists, err = store.GetObject(cmObj)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.NotNil(t, obj)
+	cm, ok := obj.(*corev1.ConfigMap)
+	require.True(t, ok)
+	require.Equal(t, "cm2", cm.Name)
+	require.Equal(t, "ns1", cm.Namespace)
+	require.Equal(t, "cmVal2", cm.Data["cmKey2"])
+
+	// Add nil object should error
+	err = store.AddObject(nil)
+	require.Error(t, err)
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,12 +36,12 @@ func TestMarshallPodMonitor(t *testing.T) {
 			},
 			PodMetricsEndpoints: []PodMetricsEndpoint{
 				{
-					Port: "metric",
+					Port: func(v string) *string { return &v }("metric"),
 				},
 			},
 		},
 	}
-	expected := `{"metadata":{"name":"test","namespace":"default","creationTimestamp":null,"labels":{"group":"group1"}},"spec":{"podMetricsEndpoints":[{"port":"metric","bearerTokenSecret":{"key":""}}],"selector":{},"namespaceSelector":{"matchNames":["test"]}}}`
+	expected := `{"metadata":{"name":"test","namespace":"default","labels":{"group":"group1"}},"spec":{"podMetricsEndpoints":[{"port":"metric"}],"selector":{},"namespaceSelector":{"matchNames":["test"]}}}`
 
 	r, err := json.Marshal(sm)
 	if err != nil {

@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: example-app
+  namespace: default
 spec:
   replicas: 3
   selector:
@@ -14,7 +15,7 @@ spec:
     spec:
       containers:
       - name: example-app
-        image: fabxc/instrumented_app:latest
+        image: quay.io/brancz/prometheus-example-app:v0.5.0
         ports:
         - name: web
           containerPort: 8080

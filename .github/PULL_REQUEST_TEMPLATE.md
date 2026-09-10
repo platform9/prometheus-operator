@@ -1,9 +1,12 @@
 ## Description
 
-_Describe the big picture of your changes here to communicate to the maintainers why we should accept this pull request.
-If it fixes a bug or resolves a feature request, be sure to link to that issue._
+_Describe the big picture of your changes here to communicate to the maintainers why we should accept this pull request._
 
+<!-- If it fixes an existing issue (bug or feature), use the following keyword -->
 
+Closes: #ISSUE-NUMBER
+
+If you're contributing for the first-time, check our [contribution guidelines](../CONTRIBUTING.md).
 
 ## Type of change
 
@@ -14,6 +17,10 @@ _What type of changes does your code introduce to the Prometheus operator? Put a
 - [ ] `BUGFIX` (non-breaking change which fixes an issue)
 - [ ] `ENHANCEMENT` (non-breaking change which improves existing functionality)
 - [ ] `NONE` (if none of the other choices apply. Example, tooling, build system, CI, docs, etc.)
+
+## Verification
+<!-- How you tested it? How do you know it works? -->
+Please check the [Prometheus-Operator testing guidelines](../TESTING.md) for recommendations about automated tests.
 
 ## Changelog entry
 

@@ -16,14 +16,18 @@
 
 package v1beta1
 
-// PagerDutyLinkConfigApplyConfiguration represents an declarative configuration of the PagerDutyLinkConfig type for use
+// PagerDutyLinkConfigApplyConfiguration represents a declarative configuration of the PagerDutyLinkConfig type for use
 // with apply.
+//
+// PagerDutyLinkConfig attaches text links to an incident
 type PagerDutyLinkConfigApplyConfiguration struct {
+	// href defines the URL of the link to be attached
 	Href *string `json:"href,omitempty"`
+	// alt defines the text that describes the purpose of the link, and can be used as the link's text.
 	Text *string `json:"alt,omitempty"`
 }
 
-// PagerDutyLinkConfigApplyConfiguration constructs an declarative configuration of the PagerDutyLinkConfig type for use with
+// PagerDutyLinkConfigApplyConfiguration constructs a declarative configuration of the PagerDutyLinkConfig type for use with
 // apply.
 func PagerDutyLinkConfig() *PagerDutyLinkConfigApplyConfiguration {
 	return &PagerDutyLinkConfigApplyConfiguration{}

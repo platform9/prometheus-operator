@@ -1,4 +1,4 @@
-// Copyright 2019 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -36,12 +37,29 @@ var (
 
 func main() {
 	flag.Parse()
+	version := os.Getenv("VERSION")
+	if version == "" {
+		version = "<unknown>"
+	}
 
 	if *certPath != "" {
 		go func() {
 			log.Fatal(mTLSEndpoint())
 		}()
 	}
+
+	// Expose a metric with UTF-8 name and label name.
+	// Depending on the Prometheus version and configuration, the metric will
+	// be ingested as-is or the dot characters will be escaped.
+	g := prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name:        "app.info",
+			Help:        "Application information",
+			ConstLabels: map[string]string{"app.version": version},
+		},
+	)
+	g.Set(1)
+	_ = prometheus.DefaultRegisterer.Register(g)
 
 	http.HandleFunc("/", handler)
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -73,12 +91,12 @@ func main() {
 	_ = http.ListenAndServe(address, nil)
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
+func handler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, time.Now().String())
 	fmt.Fprint(w, "\nAppVersion: "+os.Getenv("VERSION"))
 }
 
-func checkBasicAuth(w http.ResponseWriter, r *http.Request) bool {
+func checkBasicAuth(_ http.ResponseWriter, r *http.Request) bool {
 	s := strings.SplitN(r.Header.Get("Authorization"), " ", 2)
 	if len(s) != 2 {
 		return false
@@ -97,7 +115,7 @@ func checkBasicAuth(w http.ResponseWriter, r *http.Request) bool {
 	return pair[0] == "user" && pair[1] == "pass"
 }
 
-func checkBearerAuth(w http.ResponseWriter, r *http.Request) bool {
+func checkBearerAuth(_ http.ResponseWriter, r *http.Request) bool {
 	s := strings.SplitN(r.Header.Get("Authorization"), " ", 2)
 	if len(s) != 2 {
 		return false

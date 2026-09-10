@@ -1,4 +1,4 @@
-// Copyright 2021 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,14 +17,16 @@ package webconfig
 import (
 	"context"
 	"path"
+	"path/filepath"
 	"strings"
 
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	"github.com/prometheus-operator/prometheus-operator/pkg/k8sutil"
 	"gopkg.in/yaml.v2"
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	corev1 "k8s.io/api/core/v1"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/utils/ptr"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"github.com/prometheus-operator/prometheus-operator/pkg/k8s"
 )
 
 var (
@@ -36,13 +38,12 @@ var (
 //
 // Config can make a secret which holds the web config contents, as well as
 // volumes and volume mounts for referencing the secret and the
-// necessary TLS credentials.
+// necessary TLS files.
 type Config struct {
-	tlsConfig      *monitoringv1.WebTLSConfig
-	httpConfig     *monitoringv1.WebHTTPConfig
-	tlsCredentials *tlsCredentials
-	mountingDir    string
-	secretName     string
+	tlsConfig   *monitoringv1.WebTLSConfig
+	httpConfig  *monitoringv1.WebHTTPConfig
+	mountingDir string
+	secretName  string
 }
 
 // New creates a new Config.
@@ -53,29 +54,23 @@ func New(mountingDir string, secretName string, configFileFields monitoringv1.We
 		return nil, err
 	}
 
-	var tlsCreds *tlsCredentials
-	if tlsConfig != nil {
-		tlsCreds = newTLSCredentials(mountingDir, tlsConfig.KeySecret, tlsConfig.Cert, tlsConfig.ClientCA)
-	}
-
 	return &Config{
-		tlsConfig:      tlsConfig,
-		httpConfig:     configFileFields.HTTPConfig,
-		tlsCredentials: tlsCreds,
-		mountingDir:    mountingDir,
-		secretName:     secretName,
+		tlsConfig:   tlsConfig,
+		httpConfig:  configFileFields.HTTPConfig,
+		mountingDir: mountingDir,
+		secretName:  secretName,
 	}, nil
 }
 
 // GetMountParameters returns volumes and volume mounts referencing the config file
-// and the associated TLS credentials.
+// and the associated TLS files.
 // In addition, GetMountParameters returns a web.config.file command line option pointing
 // to the file in the volume mount.
-func (c Config) GetMountParameters() (monitoringv1.Argument, []v1.Volume, []v1.VolumeMount, error) {
+func (c Config) GetMountParameters() (monitoringv1.Argument, []corev1.Volume, []corev1.VolumeMount, error) {
 	destinationPath := path.Join(c.mountingDir, configFile)
 
-	var volumes []v1.Volume
-	var mounts []v1.VolumeMount
+	var volumes []corev1.Volume
+	var mounts []corev1.VolumeMount
 
 	arg := c.makeArg(destinationPath)
 	cfgVolume := c.makeVolume()
@@ -83,12 +78,15 @@ func (c Config) GetMountParameters() (monitoringv1.Argument, []v1.Volume, []v1.V
 
 	cfgMount := c.makeVolumeMount(destinationPath)
 	mounts = append(mounts, cfgMount)
+	tls := c.tlsConfig
 
-	if c.tlsCredentials != nil {
-		tlsVolumes, tlsMounts, err := c.tlsCredentials.getMountParameters()
+	if c.tlsConfig != nil {
+		tlsRefs := NewTLSReferences(c.mountingDir, tls.KeySecret, tls.Cert, tls.ClientCA)
+		tlsVolumes, tlsMounts, err := tlsRefs.GetMountParameters(volumePrefix)
 		if err != nil {
 			return monitoringv1.Argument{}, nil, nil, err
 		}
+
 		volumes = append(volumes, tlsVolumes...)
 		mounts = append(mounts, tlsMounts...)
 	}
@@ -96,27 +94,22 @@ func (c Config) GetMountParameters() (monitoringv1.Argument, []v1.Volume, []v1.V
 	return arg, volumes, mounts, nil
 }
 
-// CreateOrUpdateWebConfigSecret create or update a Kubernetes secret with the data for the web config file.
+// CreateOrUpdateWebConfigSecret create or update a Kubernetes secret with the
+// data for the web config file.
 // The format of the web config file is available in the official prometheus documentation:
 // https://prometheus.io/docs/prometheus/latest/configuration/https/#https-and-authentication
-func (c Config) CreateOrUpdateWebConfigSecret(ctx context.Context, secretClient clientv1.SecretInterface, labels map[string]string, ownerReference metav1.OwnerReference) error {
+func (c Config) CreateOrUpdateWebConfigSecret(ctx context.Context, secretClient typedcorev1.SecretInterface, s *corev1.Secret) error {
 	data, err := c.generateConfigFileContents()
 	if err != nil {
 		return err
 	}
 
-	secret := &v1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            c.secretName,
-			Labels:          labels,
-			OwnerReferences: []metav1.OwnerReference{ownerReference},
-		},
-		Data: map[string][]byte{
-			configFile: data,
-		},
+	s.Name = c.secretName
+	s.Data = map[string][]byte{
+		configFile: data,
 	}
 
-	return k8sutil.CreateOrUpdateSecret(ctx, secretClient, secret)
+	return k8s.CreateOrUpdateSecret(ctx, secretClient, s)
 }
 
 func (c Config) generateConfigFileContents() ([]byte, error) {
@@ -124,8 +117,7 @@ func (c Config) generateConfigFileContents() ([]byte, error) {
 		return []byte{}, nil
 	}
 
-	cfg := yaml.MapSlice{}
-
+	var cfg yaml.MapSlice
 	cfg = c.addTLSServerConfigToYaml(cfg)
 	cfg = c.addHTTPServerConfigToYaml(cfg)
 
@@ -139,36 +131,47 @@ func (c Config) addTLSServerConfigToYaml(cfg yaml.MapSlice) yaml.MapSlice {
 	}
 
 	tlsServerConfig := yaml.MapSlice{}
-	if certPath := c.tlsCredentials.getCertMountPath(); certPath != "" {
-		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{Key: "cert_file", Value: certPath})
+	tlsRefs := NewTLSReferences(c.mountingDir, tls.KeySecret, tls.Cert, tls.ClientCA)
+
+	switch {
+	case ptr.Deref(tls.CertFile, "") != "":
+		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{Key: "cert_file", Value: *tls.CertFile})
+	case tlsRefs.GetCertMountPath() != "":
+		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{Key: "cert_file", Value: filepath.Join(tlsRefs.GetCertMountPath(), tlsRefs.GetCertFilename())})
 	}
 
-	if keyPath := c.tlsCredentials.getKeyMountPath(); keyPath != "" {
-		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{Key: "key_file", Value: keyPath})
+	switch {
+	case ptr.Deref(tls.KeyFile, "") != "":
+		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{Key: "key_file", Value: *tls.KeyFile})
+	case tlsRefs.GetKeyMountPath() != "":
+		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{Key: "key_file", Value: filepath.Join(tlsRefs.GetKeyMountPath(), tlsRefs.GetKeyFilename())})
 	}
 
-	if tls.ClientAuthType != "" {
+	if ptr.Deref(tls.ClientAuthType, "") != "" {
 		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{
 			Key:   "client_auth_type",
-			Value: tls.ClientAuthType,
+			Value: *tls.ClientAuthType,
 		})
 	}
 
-	if caPath := c.tlsCredentials.getCAMountPath(); caPath != "" {
-		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{Key: "client_ca_file", Value: caPath})
+	switch {
+	case ptr.Deref(tls.ClientCAFile, "") != "":
+		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{Key: "client_ca_file", Value: *tls.ClientCAFile})
+	case tlsRefs.GetCAMountPath() != "":
+		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{Key: "client_ca_file", Value: filepath.Join(tlsRefs.GetCAMountPath(), tlsRefs.GetCAFilename())})
 	}
 
-	if tls.MinVersion != "" {
+	if ptr.Deref(tls.MinVersion, "") != "" {
 		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{
 			Key:   "min_version",
-			Value: tls.MinVersion,
+			Value: *tls.MinVersion,
 		})
 	}
 
-	if tls.MaxVersion != "" {
+	if ptr.Deref(tls.MaxVersion, "") != "" {
 		tlsServerConfig = append(tlsServerConfig, yaml.MapItem{
 			Key:   "max_version",
-			Value: tls.MaxVersion,
+			Value: *tls.MaxVersion,
 		})
 	}
 
@@ -255,19 +258,19 @@ func (c Config) makeArg(filePath string) monitoringv1.Argument {
 	return monitoringv1.Argument{Name: "web.config.file", Value: filePath}
 }
 
-func (c Config) makeVolume() v1.Volume {
-	return v1.Volume{
+func (c Config) makeVolume() corev1.Volume {
+	return corev1.Volume{
 		Name: volumeName,
-		VolumeSource: v1.VolumeSource{
-			Secret: &v1.SecretVolumeSource{
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
 				SecretName: c.secretName,
 			},
 		},
 	}
 }
 
-func (c Config) makeVolumeMount(filePath string) v1.VolumeMount {
-	return v1.VolumeMount{
+func (c Config) makeVolumeMount(filePath string) corev1.VolumeMount {
+	return corev1.VolumeMount{
 		Name:      volumeName,
 		SubPath:   configFile,
 		ReadOnly:  true,

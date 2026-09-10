@@ -16,18 +16,34 @@
 
 package v1
 
-// AlertmanagerStatusApplyConfiguration represents an declarative configuration of the AlertmanagerStatus type for use
+// AlertmanagerStatusApplyConfiguration represents a declarative configuration of the AlertmanagerStatus type for use
 // with apply.
+//
+// AlertmanagerStatus is the most recent observed status of the Alertmanager cluster. Read-only.
+// More info:
+// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
 type AlertmanagerStatusApplyConfiguration struct {
-	Paused              *bool                         `json:"paused,omitempty"`
-	Replicas            *int32                        `json:"replicas,omitempty"`
-	UpdatedReplicas     *int32                        `json:"updatedReplicas,omitempty"`
-	AvailableReplicas   *int32                        `json:"availableReplicas,omitempty"`
-	UnavailableReplicas *int32                        `json:"unavailableReplicas,omitempty"`
-	Conditions          []ConditionApplyConfiguration `json:"conditions,omitempty"`
+	// paused defines whether any actions on the underlying managed objects are
+	// being performed. Only delete actions will be performed.
+	Paused *bool `json:"paused,omitempty"`
+	// replicas defines the total number of non-terminated pods targeted by this Alertmanager
+	// object (their labels match the selector).
+	Replicas *int32 `json:"replicas,omitempty"`
+	// updatedReplicas defines the total number of non-terminated pods targeted by this Alertmanager
+	// object that have the desired version spec.
+	UpdatedReplicas *int32 `json:"updatedReplicas,omitempty"`
+	// availableReplicas defines the total number of available pods (ready for at least minReadySeconds)
+	// targeted by this Alertmanager cluster.
+	AvailableReplicas *int32 `json:"availableReplicas,omitempty"`
+	// unavailableReplicas defines the total number of unavailable pods targeted by this Alertmanager object.
+	UnavailableReplicas *int32 `json:"unavailableReplicas,omitempty"`
+	// selector used to match the pods targeted by this Alertmanager object.
+	Selector *string `json:"selector,omitempty"`
+	// conditions defines the current state of the Alertmanager object.
+	Conditions []ConditionApplyConfiguration `json:"conditions,omitempty"`
 }
 
-// AlertmanagerStatusApplyConfiguration constructs an declarative configuration of the AlertmanagerStatus type for use with
+// AlertmanagerStatusApplyConfiguration constructs a declarative configuration of the AlertmanagerStatus type for use with
 // apply.
 func AlertmanagerStatus() *AlertmanagerStatusApplyConfiguration {
 	return &AlertmanagerStatusApplyConfiguration{}
@@ -70,6 +86,14 @@ func (b *AlertmanagerStatusApplyConfiguration) WithAvailableReplicas(value int32
 // If called multiple times, the UnavailableReplicas field is set to the value of the last call.
 func (b *AlertmanagerStatusApplyConfiguration) WithUnavailableReplicas(value int32) *AlertmanagerStatusApplyConfiguration {
 	b.UnavailableReplicas = &value
+	return b
+}
+
+// WithSelector sets the Selector field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Selector field is set to the value of the last call.
+func (b *AlertmanagerStatusApplyConfiguration) WithSelector(value string) *AlertmanagerStatusApplyConfiguration {
+	b.Selector = &value
 	return b
 }
 

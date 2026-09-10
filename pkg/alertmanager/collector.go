@@ -1,4 +1,4 @@
-// Copyright 2016 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
 package alertmanager
 
 import (
-	"github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 )
 
 var (

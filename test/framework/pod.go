@@ -1,4 +1,4 @@
-// Copyright 2016 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,10 +22,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
-	"github.com/pkg/errors"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	kscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/portforward"
@@ -33,22 +34,48 @@ import (
 	"k8s.io/client-go/transport/spdy"
 )
 
-// PrintPodLogs prints the logs of a specified Pod
-func (f *Framework) PrintPodLogs(ctx context.Context, ns, p string) error {
-	pod, err := f.KubeClient.CoreV1().Pods(ns).Get(ctx, p, metav1.GetOptions{})
+type LogOptions struct {
+	Container    string
+	TailLines    int64
+	SinceSeconds int64
+}
+
+// WritePodLogs writes the logs of a specified Pod.
+func (f *Framework) WritePodLogs(ctx context.Context, w io.Writer, ns, pod string, opts LogOptions) error {
+	p, err := f.KubeClient.CoreV1().Pods(ns).Get(ctx, pod, metav1.GetOptions{})
 	if err != nil {
-		return errors.Wrapf(err, "failed to print logs of pod '%v': failed to get pod", p)
+		return fmt.Errorf("failed to get pod %s/%s: %w", ns, pod, err)
 	}
 
-	for _, c := range pod.Spec.Containers {
-		req := f.KubeClient.CoreV1().Pods(ns).GetLogs(p, &v1.PodLogOptions{Container: c.Name})
+	var containers []string
+	for _, c := range p.Spec.Containers {
+		if opts.Container != "" && c.Name != opts.Container {
+			continue
+		}
+		containers = append(containers, c.Name)
+	}
+
+	plo := corev1.PodLogOptions{}
+	if opts.TailLines > 0 {
+		plo.TailLines = &opts.TailLines
+	}
+	if opts.SinceSeconds > 0 {
+		plo.SinceSeconds = &opts.SinceSeconds
+	}
+
+	for _, c := range containers {
+		plo.Container = c
+		req := f.KubeClient.CoreV1().Pods(ns).GetLogs(pod, &plo)
 		resp, err := req.DoRaw(ctx)
 		if err != nil {
-			return errors.Wrapf(err, "failed to retrieve logs of pod '%v'", p)
+			return fmt.Errorf("failed to retrieve logs of container %q (pod %s/%s): %w", c, ns, pod, err)
 		}
 
-		fmt.Printf("=== Logs of %v/%v/%v:", ns, p, c.Name)
-		fmt.Println(string(resp))
+		_, err = w.Write(resp)
+		fmt.Fprint(w, "\n")
+		if err != nil {
+			return fmt.Errorf("failed to write logs: %w", err)
+		}
 	}
 
 	return nil
@@ -59,7 +86,7 @@ func (f *Framework) PrintPodLogs(ctx context.Context, ns, p string) error {
 func (f *Framework) GetPodRestartCount(ctx context.Context, ns, podName string) (map[string]int32, error) {
 	pod, err := f.KubeClient.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to retrieve pod to get restart count")
+		return nil, fmt.Errorf("failed to retrieve pod to get restart count: %w", err)
 	}
 
 	restarts := map[string]int32{}
@@ -71,7 +98,7 @@ func (f *Framework) GetPodRestartCount(ctx context.Context, ns, podName string) 
 	return restarts, nil
 }
 
-// ExecOptions passed to ExecWithOptions
+// ExecOptions passed to ExecWithOptions.
 type ExecOptions struct {
 	Command       []string
 	Namespace     string
@@ -97,7 +124,7 @@ func (f *Framework) ExecWithOptions(ctx context.Context, options ExecOptions) (s
 		Namespace(options.Namespace).
 		SubResource("exec").
 		Param("container", options.ContainerName)
-	req.VersionedParams(&v1.PodExecOptions{
+	req.VersionedParams(&corev1.PodExecOptions{
 		Container: options.ContainerName,
 		Command:   options.Command,
 		Stdin:     options.Stdin != nil,
@@ -170,4 +197,45 @@ func StartPortForward(ctx context.Context, config *rest.Config, scheme string, n
 		}
 		return nil, fmt.Errorf("%v: %v", ctx.Err(), err)
 	}
+}
+
+// WaitForContainerInErrPullImage waits for the container in the pod using
+// `image` to be in waiting state with ErrPullImage or ImagePullBackOff reason.
+func (f *Framework) WaitForContainerInErrPullImage(ctx context.Context, namespace, pod, image string) error {
+	var loopError error
+	err := wait.PollUntilContextTimeout(ctx, time.Second, f.DefaultTimeout, true, func(_ context.Context) (bool, error) {
+		ctx := context.Background()
+		pod, err := f.KubeClient.CoreV1().Pods(namespace).Get(ctx, pod, metav1.GetOptions{})
+		if err != nil {
+			loopError = err
+			return false, nil
+		}
+
+		// Ensure that the container is stuck on ErrImagePull or ImagePullBackOff.
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.Image != image {
+				continue
+			}
+
+			if cs.State.Waiting == nil {
+				loopError = fmt.Errorf("container not waiting")
+				return false, nil
+			}
+
+			if cs.State.Waiting.Reason != "ErrPullImage" && cs.State.Waiting.Reason != "ImagePullBackOff" {
+				loopError = fmt.Errorf("container waiting with reason %q", cs.State.Waiting.Reason)
+				return false, nil
+			}
+
+			return true, nil
+		}
+
+		loopError = fmt.Errorf("found no container with image %q", image)
+		return false, nil
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %w", err, loopError)
+	}
+
+	return nil
 }

@@ -1,4 +1,4 @@
-// Copyright 2016 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/go-test/deep"
+
+	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
 )
 
 var cases = []struct {
@@ -40,8 +42,8 @@ var cases = []struct {
 func TestCreateOrdinalEnvVar(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.in, func(t *testing.T) {
-			os.Setenv(statefulsetOrdinalFromEnvvarDefault, tt.in)
-			s := createOrdinalEnvvar(statefulsetOrdinalFromEnvvarDefault)
+			os.Setenv(operator.PodNameEnvVar, tt.in)
+			s := createOrdinalEnvvar(operator.PodNameEnvVar)
 			if os.Getenv(statefulsetOrdinalEnvvar) != tt.out {
 				t.Errorf("got %v, want %s", s, tt.out)
 			}

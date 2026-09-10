@@ -17,19 +17,30 @@
 package v1alpha1
 
 import (
-	v1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
+	monitoringv1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
 )
 
-// MatcherApplyConfiguration represents an declarative configuration of the Matcher type for use
+// MatcherApplyConfiguration represents a declarative configuration of the Matcher type for use
 // with apply.
+//
+// Matcher defines how to match on alert's labels.
 type MatcherApplyConfiguration struct {
-	Name      *string             `json:"name,omitempty"`
-	Value     *string             `json:"value,omitempty"`
-	MatchType *v1alpha1.MatchType `json:"matchType,omitempty"`
-	Regex     *bool               `json:"regex,omitempty"`
+	// name defines the label to match.
+	// This specifies which alert label should be evaluated.
+	Name *string `json:"name,omitempty"`
+	// value defines the label value to match.
+	// This is the expected value for the specified label.
+	Value *string `json:"value,omitempty"`
+	// matchType defines the match operation available with AlertManager >= v0.22.0.
+	// Takes precedence over Regex (deprecated) if non-empty.
+	// Valid values: "=" (equality), "!=" (inequality), "=~" (regex match), "!~" (regex non-match).
+	MatchType *monitoringv1alpha1.MatchType `json:"matchType,omitempty"`
+	// regex defines whether to match on equality (false) or regular-expression (true).
+	// Deprecated: for AlertManager >= v0.22.0, `matchType` should be used instead.
+	Regex *bool `json:"regex,omitempty"`
 }
 
-// MatcherApplyConfiguration constructs an declarative configuration of the Matcher type for use with
+// MatcherApplyConfiguration constructs a declarative configuration of the Matcher type for use with
 // apply.
 func Matcher() *MatcherApplyConfiguration {
 	return &MatcherApplyConfiguration{}
@@ -54,7 +65,7 @@ func (b *MatcherApplyConfiguration) WithValue(value string) *MatcherApplyConfigu
 // WithMatchType sets the MatchType field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the MatchType field is set to the value of the last call.
-func (b *MatcherApplyConfiguration) WithMatchType(value v1alpha1.MatchType) *MatcherApplyConfiguration {
+func (b *MatcherApplyConfiguration) WithMatchType(value monitoringv1alpha1.MatchType) *MatcherApplyConfiguration {
 	b.MatchType = &value
 	return b
 }

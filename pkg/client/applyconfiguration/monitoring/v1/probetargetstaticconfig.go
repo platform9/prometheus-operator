@@ -16,19 +16,22 @@
 
 package v1
 
-import (
-	v1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-)
-
-// ProbeTargetStaticConfigApplyConfiguration represents an declarative configuration of the ProbeTargetStaticConfig type for use
+// ProbeTargetStaticConfigApplyConfiguration represents a declarative configuration of the ProbeTargetStaticConfig type for use
 // with apply.
+//
+// ProbeTargetStaticConfig defines the set of static targets considered for probing.
 type ProbeTargetStaticConfigApplyConfiguration struct {
-	Targets        []string            `json:"static,omitempty"`
-	Labels         map[string]string   `json:"labels,omitempty"`
-	RelabelConfigs []*v1.RelabelConfig `json:"relabelingConfigs,omitempty"`
+	// static defines the list of hosts to probe.
+	Targets []string `json:"static,omitempty"`
+	// labels defines all labels assigned to all metrics scraped from the targets.
+	Labels map[string]string `json:"labels,omitempty"`
+	// relabelingConfigs defines relabelings to be apply to the label set of the targets before it gets
+	// scraped.
+	// More info: https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config
+	RelabelConfigs []RelabelConfigApplyConfiguration `json:"relabelingConfigs,omitempty"`
 }
 
-// ProbeTargetStaticConfigApplyConfiguration constructs an declarative configuration of the ProbeTargetStaticConfig type for use with
+// ProbeTargetStaticConfigApplyConfiguration constructs a declarative configuration of the ProbeTargetStaticConfig type for use with
 // apply.
 func ProbeTargetStaticConfig() *ProbeTargetStaticConfigApplyConfiguration {
 	return &ProbeTargetStaticConfigApplyConfiguration{}
@@ -61,7 +64,7 @@ func (b *ProbeTargetStaticConfigApplyConfiguration) WithLabels(entries map[strin
 // WithRelabelConfigs adds the given value to the RelabelConfigs field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the RelabelConfigs field.
-func (b *ProbeTargetStaticConfigApplyConfiguration) WithRelabelConfigs(values ...**v1.RelabelConfig) *ProbeTargetStaticConfigApplyConfiguration {
+func (b *ProbeTargetStaticConfigApplyConfiguration) WithRelabelConfigs(values ...*RelabelConfigApplyConfiguration) *ProbeTargetStaticConfigApplyConfiguration {
 	for i := range values {
 		if values[i] == nil {
 			panic("nil value passed to WithRelabelConfigs")

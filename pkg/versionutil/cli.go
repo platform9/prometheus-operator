@@ -13,6 +13,7 @@
 // limitations under the License.
 
 // Holds the CLI related version functions that unifies handling version printing in all CLIs binaries.
+
 package versionutil
 
 import (
@@ -31,14 +32,14 @@ var (
 
 // RegisterParseFlags registers and parses version related flags.
 func RegisterParseFlags() {
-	RegisterFlags()
+	RegisterFlags(flag.CommandLine)
 	flag.Parse()
 }
 
 // RegisterFlags registers version related flags to core.
-func RegisterFlags() {
-	flag.BoolVar(&printVer, "version", false, "Prints current version.")
-	flag.BoolVar(&printShort, "short-version", false, "Print just the version number.")
+func RegisterFlags(fs *flag.FlagSet) {
+	fs.BoolVar(&printVer, "version", false, "Prints current version.")
+	fs.BoolVar(&printShort, "short-version", false, "Print just the version number.")
 }
 
 // RegisterIntoKingpinFlags registers version related flags in kingpin framework.

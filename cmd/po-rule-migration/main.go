@@ -1,4 +1,4 @@
-// Copyright 2018 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,29 +17,31 @@ package main
 import (
 	"bytes"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path"
 	"path/filepath"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sYAML "k8s.io/apimachinery/pkg/util/yaml"
+	"sigs.k8s.io/yaml"
+
 	monitoring "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/prometheus-operator/prometheus-operator/pkg/versionutil"
-
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8sYAML "k8s.io/apimachinery/pkg/util/yaml"
-
-	"github.com/pkg/errors"
-	"sigs.k8s.io/yaml"
 )
 
 func main() {
-	versionutil.RegisterFlags()
+	fs := flag.CommandLine
+	versionutil.RegisterFlags(fs)
 
 	var ruleConfigMapName = flag.String("rule-config-map", "", "path to rule ConfigMap")
 	var ruleCRDSDestination = flag.String("rule-crds-destination", "", "destination new crds should be created in")
-	flag.Parse()
+
+	// No need to check for errors because Parse would exit on error.
+	_ = fs.Parse(os.Args[1:])
 
 	if versionutil.ShouldPrintVersion() {
 		versionutil.Print(os.Stdout, "po-rule-migration")
@@ -69,7 +71,7 @@ func main() {
 		log.Fatalf("failed to read file '%v': %v", ruleConfigMapName, err.Error())
 	}
 
-	configMap := v1.ConfigMap{}
+	configMap := corev1.ConfigMap{}
 
 	err = k8sYAML.NewYAMLOrJSONDecoder(file, 100).Decode(&configMap)
 	if err != nil {
@@ -97,17 +99,16 @@ func main() {
 // CMToRule takes a rule ConfigMap and transforms it to possibly multiple
 // rule file crds. It is used in `cmd/po-rule-cm-to-rule-file-crds`. Thereby it
 // needs to be public.
-func CMToRule(cm *v1.ConfigMap) ([]monitoringv1.PrometheusRule, error) {
+func CMToRule(cm *corev1.ConfigMap) ([]monitoringv1.PrometheusRule, error) {
 	rules := []monitoringv1.PrometheusRule{}
 
 	for name, content := range cm.Data {
 		ruleSpec := monitoringv1.PrometheusRuleSpec{}
 
 		if err := k8sYAML.NewYAMLOrJSONDecoder(bytes.NewBufferString(content), 1000).Decode(&ruleSpec); err != nil {
-			return []monitoringv1.PrometheusRule{}, errors.Wrapf(
-				err,
-				"unmarshal rules file %v in  configmap '%v' in namespace '%v'",
-				name, cm.Name, cm.Namespace,
+			return []monitoringv1.PrometheusRule{}, fmt.Errorf(
+				"unmarshal rules file %v in  configmap '%v' in namespace '%v': %w",
+				name, cm.Name, cm.Namespace, err,
 			)
 		}
 

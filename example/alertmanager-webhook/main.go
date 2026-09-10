@@ -1,4 +1,4 @@
-// Copyright 2017 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ const (
 
 func main() {
 	fmt.Printf("Listening for Alertmanager notifications on :%s\n", port)
-	_ = http.ListenAndServe(":"+port, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	_ = http.ListenAndServe(":"+port, http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		fmt.Println("Alertmanager Notification Payload Received")
 	}))
 }

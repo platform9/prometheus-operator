@@ -1,4 +1,4 @@
-// Copyright 2019 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,18 +16,31 @@ package operator
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/events"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"github.com/prometheus-operator/prometheus-operator/pkg/client/versioned/scheme"
+)
+
+const (
+	// InvalidConfigurationEvent is the  type used for events reporting invalid
+	// configuration resources.
+	InvalidConfigurationEvent = "InvalidConfiguration"
 )
 
 var (
@@ -46,12 +59,14 @@ var (
 )
 
 type ReconciliationStatus struct {
-	err error
+	err     error
+	reason  string
+	message string
 }
 
 func (rs ReconciliationStatus) Reason() string {
 	if rs.Ok() {
-		return ""
+		return rs.reason
 	}
 
 	return "ReconciliationFailed"
@@ -59,7 +74,7 @@ func (rs ReconciliationStatus) Reason() string {
 
 func (rs ReconciliationStatus) Message() string {
 	if rs.Ok() {
-		return ""
+		return rs.message
 	}
 
 	return rs.err.Error()
@@ -70,31 +85,92 @@ func (rs ReconciliationStatus) Ok() bool {
 }
 
 // ReconciliationTracker tracks reconciliation status per object.
+//
+// It only uses their `<namespace>/<name>` key to identify objects.
+//
 // The zero ReconciliationTracker is ready to use.
 type ReconciliationTracker struct {
 	once sync.Once
+
 	// mtx protects all fields below.
 	mtx            sync.RWMutex
 	statusByObject map[string]ReconciliationStatus
+	refTracker     map[string]ReferenceTracker
 }
 
-// SetStatus updates the last reconciliation status for the given object.
-func (rt *ReconciliationTracker) SetStatus(k string, err error) {
+// ReferenceTracker returns true if it has a reference to the object.
+type ReferenceTracker interface {
+	Has(runtime.Object) bool
+}
+
+func (rt *ReconciliationTracker) init() {
+	rt.once.Do(func() {
+		rt.statusByObject = map[string]ReconciliationStatus{}
+		rt.refTracker = map[string]ReferenceTracker{}
+	})
+}
+
+// HasRefTo returns true if the object identified by key has a direct or
+// indirect reference to obj (secret or configmap).
+func (rt *ReconciliationTracker) HasRefTo(key string, obj runtime.Object) bool {
+	rt.mtx.RLock()
+	defer rt.mtx.RUnlock()
+
+	refTracker, found := rt.refTracker[key]
+	if !found {
+		return false
+	}
+
+	return refTracker.Has(obj)
+}
+
+// UpdateReferenceTracker updates the reference tracker for the object identified by key.
+func (rt *ReconciliationTracker) UpdateReferenceTracker(key string, refTracker ReferenceTracker) {
+	rt.init()
 	rt.mtx.Lock()
 	defer rt.mtx.Unlock()
 
-	rt.once.Do(func() {
-		rt.statusByObject = map[string]ReconciliationStatus{}
-	})
+	rt.refTracker[key] = refTracker
+}
 
-	rt.statusByObject[k] = ReconciliationStatus{err: err}
+// ResetStatus resets the reconciliation status for the object identified by key.
+func (rt *ReconciliationTracker) ResetStatus(key string) {
+	rt.init()
+	rt.mtx.Lock()
+	defer rt.mtx.Unlock()
+
+	rt.statusByObject[key] = ReconciliationStatus{}
+}
+
+// SetStatus updates the last reconciliation status for the object identified by key.
+func (rt *ReconciliationTracker) SetStatus(key string, err error) {
+	rt.init()
+	rt.mtx.Lock()
+	defer rt.mtx.Unlock()
+
+	rs := rt.statusByObject[key]
+	rs.err = err
+	rt.statusByObject[key] = rs
+}
+
+// SetReasonAndMessage updates the reason and message for the object identified by key.
+// The reason and message are only used when the reconciliation returned no error.
+func (rt *ReconciliationTracker) SetReasonAndMessage(key string, reason, message string) {
+	rt.init()
+	rt.mtx.Lock()
+	defer rt.mtx.Unlock()
+
+	rs := rt.statusByObject[key]
+	rs.reason = reason
+	rs.message = message
+	rt.statusByObject[key] = rs
 }
 
 // GetStatus returns the last reconciliation status for the given object.
 // The second value indicates whether the object is known or not.
-func (rt *ReconciliationTracker) GetStatus(k string) (ReconciliationStatus, bool) {
-	rt.mtx.Lock()
-	defer rt.mtx.Unlock()
+func (rt *ReconciliationTracker) getStatus(k string) (ReconciliationStatus, bool) {
+	rt.mtx.RLock()
+	defer rt.mtx.RUnlock()
 
 	s, found := rt.statusByObject[k]
 	if !found {
@@ -104,9 +180,37 @@ func (rt *ReconciliationTracker) GetStatus(k string) (ReconciliationStatus, bool
 	return s, true
 }
 
+// GetCondition returns a monitoringv1.Condition for the last-known
+// reconciliation status of the given object.
+func (rt *ReconciliationTracker) GetCondition(k string, gen int64) monitoringv1.Condition {
+	condition := monitoringv1.Condition{
+		Type:   monitoringv1.Reconciled,
+		Status: monitoringv1.ConditionTrue,
+		LastTransitionTime: metav1.Time{
+			Time: time.Now().UTC(),
+		},
+		ObservedGeneration: gen,
+	}
+
+	reconciliationStatus, found := rt.getStatus(k)
+	if !found {
+		condition.Status = monitoringv1.ConditionUnknown
+		condition.Reason = "NotFound"
+		condition.Message = fmt.Sprintf("object %q not found", k)
+	} else {
+		if !reconciliationStatus.Ok() {
+			condition.Status = monitoringv1.ConditionFalse
+		}
+		condition.Reason = reconciliationStatus.Reason()
+		condition.Message = reconciliationStatus.Message()
+	}
+
+	return condition
+}
+
 // ForgetObject removes the given object from the tracker.
 // It should be called when the controller detects that the object has been deleted.
-func (rt *ReconciliationTracker) ForgetObject(k string) {
+func (rt *ReconciliationTracker) ForgetObject(key string) {
 	rt.mtx.Lock()
 	defer rt.mtx.Unlock()
 
@@ -114,7 +218,8 @@ func (rt *ReconciliationTracker) ForgetObject(k string) {
 		return
 	}
 
-	delete(rt.statusByObject, k)
+	delete(rt.statusByObject, key)
+	delete(rt.refTracker, key)
 }
 
 // Describe implements the prometheus.Collector interface.
@@ -131,6 +236,8 @@ func (rt *ReconciliationTracker) Collect(ch chan<- prometheus.Metric) {
 	for _, st := range rt.statusByObject {
 		if st.Ok() {
 			ok++
+		} else {
+			failed++
 		}
 	}
 
@@ -223,6 +330,58 @@ func NewMetrics(r prometheus.Registerer) *Metrics {
 	)
 
 	return &m
+}
+
+// EventRecorderFactory returns an function to create EventRecorder objects.
+type EventRecorderFactory func(client kubernetes.Interface, component string) NewEventRecorderFunc
+
+// NewEventRecorderFunc returns an EventRecorder which will automatically inject the given runtime.Object as related.
+type NewEventRecorderFunc func(related runtime.Object) *EventRecorder
+
+// EventRecorder records events which are related to the associated Object.
+type EventRecorder struct {
+	er      events.EventRecorder
+	related runtime.Object
+}
+
+func NewFakeRecorder(bufferSize int, related runtime.Object) *EventRecorder {
+	return &EventRecorder{
+		related: related,
+		er:      events.NewFakeRecorder(bufferSize),
+	}
+}
+
+// Eventf records a Kubernetes event.
+func (er *EventRecorder) Eventf(regarding runtime.Object, eventtype, reason, action, note string, args ...any) {
+	er.er.Eventf(
+		regarding,
+		er.related,
+		eventtype,
+		reason,
+		action,
+		note,
+		args...,
+	)
+}
+
+func NewEventRecorderFactory(emitEvents bool) EventRecorderFactory {
+	return func(client kubernetes.Interface, component string) NewEventRecorderFunc {
+		eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
+		eventBroadcaster.StartStructuredLogging(0)
+
+		if emitEvents {
+			_ = eventBroadcaster.StartRecordingToSinkWithContext(context.Background())
+		}
+
+		eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, component)
+
+		return func(related runtime.Object) *EventRecorder {
+			return &EventRecorder{
+				er:      eventRecorder,
+				related: related,
+			}
+		}
+	}
 }
 
 // StsDeleteCreateCounter returns a counter to track statefulset's recreations.
@@ -339,6 +498,7 @@ func (m *Metrics) NewInstrumentedListerWatcher(lw cache.ListerWatcher) cache.Lis
 // List implements the cache.ListerWatcher interface.
 func (i *instrumentedListerWatcher) List(options metav1.ListOptions) (runtime.Object, error) {
 	i.listTotal.Inc()
+	//nolint:staticcheck // Ignore SA1019 the function is deprecated.
 	ret, err := i.next.List(options)
 	if err != nil {
 		i.listFailed.Inc()
@@ -346,9 +506,26 @@ func (i *instrumentedListerWatcher) List(options metav1.ListOptions) (runtime.Ob
 	return ret, err
 }
 
+// IsWatchListSemanticsUnSupported calls the wrapped ListerWatcher if it
+// implements the function. Otherwise it returns false.
+// It is only required for the unpriviliged namespace ListerWatcher which
+// doesn't support the new ListWatch semantics.
+func (i *instrumentedListerWatcher) IsWatchListSemanticsUnSupported() bool {
+	type unSupportedWatchListSemantics interface {
+		IsWatchListSemanticsUnSupported() bool
+	}
+
+	lw, ok := i.next.(unSupportedWatchListSemantics)
+	if !ok {
+		return false
+	}
+	return lw.IsWatchListSemanticsUnSupported()
+}
+
 // Watch implements the cache.ListerWatcher interface.
 func (i *instrumentedListerWatcher) Watch(options metav1.ListOptions) (watch.Interface, error) {
 	i.watchTotal.Inc()
+	//nolint:staticcheck // Ignore SA1019 the function is deprecated.
 	ret, err := i.next.Watch(options)
 	if err != nil {
 		i.watchFailed.Inc()
@@ -373,7 +550,7 @@ func SanitizeSTS(sts *appsv1.StatefulSet) {
 // than 1 minute, it means that something is stuck and the message will
 // indicate to the admin which informer is the culprit.
 // See https://github.com/prometheus-operator/prometheus-operator/issues/3347.
-func WaitForNamedCacheSync(ctx context.Context, controllerName string, logger log.Logger, inf cache.SharedIndexInformer) bool {
+func WaitForNamedCacheSync(ctx context.Context, controllerName string, logger *slog.Logger, inf cache.SharedIndexInformer) bool {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
@@ -384,7 +561,7 @@ func WaitForNamedCacheSync(ctx context.Context, controllerName string, logger lo
 		for {
 			select {
 			case <-t.C:
-				level.Warn(logger).Log("msg", "cache sync not yet completed")
+				logger.Warn("cache sync not yet completed")
 			case <-ctx.Done():
 				return
 			}
@@ -393,10 +570,70 @@ func WaitForNamedCacheSync(ctx context.Context, controllerName string, logger lo
 
 	ok := cache.WaitForNamedCacheSync(controllerName, ctx.Done(), inf.HasSynced)
 	if !ok {
-		level.Error(logger).Log("msg", "failed to sync cache")
+		logger.Error("failed to sync cache")
 	} else {
-		level.Debug(logger).Log("msg", "successfully synced cache")
+		logger.Debug("successfully synced cache")
 	}
 
 	return ok
+}
+
+// ConfigMapGVK returns the GroupVersionKind representing ConfigMap objects.
+func ConfigMapGVK() schema.GroupVersionKind {
+	return corev1.SchemeGroupVersion.WithKind("ConfigMap")
+}
+
+// SecretGVK returns the GroupVersionKind representing Secret objects.
+func SecretGVK() schema.GroupVersionKind {
+	return corev1.SchemeGroupVersion.WithKind("Secret")
+}
+
+// SelectNamespacesFromCache returns the selected namespaces from the informer's cache.
+func SelectNamespacesFromCache(obj metav1.Object, sel *metav1.LabelSelector, nsInfs cache.SharedIndexInformer) ([]string, error) {
+	// If the selector is nil, return the object's namespace.
+	if sel == nil {
+		return []string{obj.GetNamespace()}, nil
+	}
+
+	labelSelector, err := metav1.LabelSelectorAsSelector(sel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert namespace label selector to selector: %w", err)
+	}
+
+	var ns []string
+	err = cache.ListAll(nsInfs.GetStore(), labelSelector, func(obj any) {
+		ns = append(ns, obj.(*corev1.Namespace).Name)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list namespaces: %w", err)
+	}
+	slices.Sort(ns)
+
+	return ns, nil
+}
+
+// GetByKeyer is an interface which exposes only the GetByKey() method of the
+// cache.Store interface.
+type GetByKeyer interface {
+	GetByKey(string) (any, bool, error)
+}
+
+// NewMultiGetByKeyer returns an interface which queries multiple GetByKeyer in
+// sequence and returns the first found object.
+func NewMultiGetByKeyer(gbk ...GetByKeyer) GetByKeyer {
+	return multiGetByKeyer(gbk)
+}
+
+type multiGetByKeyer []GetByKeyer
+
+// GetByKey implements the GetByKeyer interface.
+func (m multiGetByKeyer) GetByKey(key string) (any, bool, error) {
+	for _, gbk := range m {
+		o, found, err := gbk.GetByKey(key)
+		if err != nil || found {
+			return o, found, err
+		}
+	}
+
+	return nil, false, nil
 }

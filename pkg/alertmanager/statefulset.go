@@ -1,4 +1,4 @@
-// Copyright 2016 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,26 +16,33 @@ package alertmanager
 
 import (
 	"fmt"
+	"log/slog"
+	"maps"
 	"net/url"
 	"path"
 	"strings"
+	"time"
 
+	"github.com/alecthomas/units"
+	"github.com/blang/semver/v4"
 	appsv1 "k8s.io/api/apps/v1"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 
-	"github.com/blang/semver/v4"
-	"github.com/pkg/errors"
+	"github.com/prometheus-operator/prometheus-operator/pkg/alertmanager/clustertlsconfig"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	"github.com/prometheus-operator/prometheus-operator/pkg/k8sutil"
+	"github.com/prometheus-operator/prometheus-operator/pkg/k8s"
 	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
 	"github.com/prometheus-operator/prometheus-operator/pkg/webconfig"
 )
 
 const (
-	governingServiceName = "alertmanager-operated"
+	// WARNING: Do not use directly - users might specify a different service name!
+	defaultOperatedServiceName = "alertmanager-operated"
 
 	defaultRetention = "120h"
 	defaultPortName  = "web"
@@ -47,6 +54,7 @@ const (
 	alertmanagerTemplatesVolumeName    = "notification-templates"
 	alertmanagerTemplatesDir           = "/etc/alertmanager/templates"
 	webConfigDir                       = "/etc/alertmanager/web_config"
+	clusterTLSConfigDir                = "/etc/alertmanager/cluster_tls_config"
 	alertmanagerConfigVolumeName       = "config-volume"
 	alertmanagerConfigDir              = "/etc/alertmanager/config"
 	alertmanagerConfigOutVolumeName    = "config-out"
@@ -55,9 +63,14 @@ const (
 	alertmanagerConfigFileCompressed   = "alertmanager.yaml.gz"
 	alertmanagerConfigEnvsubstFilename = "alertmanager.env.yaml"
 
+	alertmanagerWebPort         = 9093
+	alertmanagerMeshPort        = 9094
+	alertmanagerMeshUDPPortName = "mesh-udp"
+	alertmanagerMeshTCPPortName = "mesh-tcp"
+
 	alertmanagerStorageDir = "/alertmanager"
 
-	sSetInputHashName = "prometheus-operator-input-hash"
+	defaultTerminationGracePeriodSeconds = int64(120)
 )
 
 var (
@@ -65,7 +78,51 @@ var (
 	probeTimeoutSeconds int32 = 3
 )
 
-func makeStatefulSet(am *monitoringv1.Alertmanager, config Config, inputHash string, tlsAssetSecrets []string) (*appsv1.StatefulSet, error) {
+func isZeroGoDuration(value monitoringv1.GoDuration) bool {
+	if value == "" {
+		return false
+	}
+
+	d, err := time.ParseDuration(string(value))
+	return err == nil && d <= 0
+}
+
+func discardZeroDurations(am *monitoringv1.Alertmanager) []string {
+	var ignored []string
+
+	for _, field := range []struct {
+		name  string
+		value *monitoringv1.GoDuration
+	}{
+		{"retention", &am.Spec.Retention},
+		{"clusterGossipInterval", &am.Spec.ClusterGossipInterval},
+		{"clusterPushpullInterval", &am.Spec.ClusterPushpullInterval},
+		{"clusterPeerTimeout", &am.Spec.ClusterPeerTimeout},
+	} {
+		if field.value == nil {
+			continue
+		}
+
+		if !isZeroGoDuration(*field.value) {
+			continue
+		}
+
+		*field.value = ""
+		ignored = append(ignored, fmt.Sprintf("%s (zero value not supported)", field.name))
+	}
+
+	return ignored
+}
+
+func ignoredFieldsMessage(fields []string) string {
+	return "The following fields were ignored: " + strings.Join(fields, ", ")
+}
+
+func getServiceName(a *monitoringv1.Alertmanager) string {
+	return ptr.Deref(a.Spec.ServiceName, defaultOperatedServiceName)
+}
+
+func makeStatefulSet(logger *slog.Logger, am *monitoringv1.Alertmanager, config Config, inputHash string, tlsSecrets *operator.ShardedSecret) (*appsv1.StatefulSet, error) {
 	// TODO(fabxc): is this the right point to inject defaults?
 	// Ideally we would do it before storing but that's currently not possible.
 	// Potentially an update handler on first insertion.
@@ -85,81 +142,68 @@ func makeStatefulSet(am *monitoringv1.Alertmanager, config Config, inputHash str
 		am.Spec.Retention = defaultRetention
 	}
 	if am.Spec.Resources.Requests == nil {
-		am.Spec.Resources.Requests = v1.ResourceList{}
+		am.Spec.Resources.Requests = corev1.ResourceList{}
 	}
-	if _, ok := am.Spec.Resources.Requests[v1.ResourceMemory]; !ok {
-		am.Spec.Resources.Requests[v1.ResourceMemory] = resource.MustParse("200Mi")
+	if _, ok := am.Spec.Resources.Requests[corev1.ResourceMemory]; !ok {
+		am.Spec.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("200Mi")
 	}
 
-	spec, err := makeStatefulSetSpec(am, config, tlsAssetSecrets)
+	spec, err := makeStatefulSetSpec(logger, am, config, tlsSecrets)
 	if err != nil {
 		return nil, err
 	}
 
-	boolTrue := true
-	// do not transfer kubectl annotations to the statefulset so it is not
-	// pruned by kubectl
-	annotations := make(map[string]string)
-	for key, value := range am.ObjectMeta.Annotations {
-		if !strings.HasPrefix(key, "kubectl.kubernetes.io/") {
-			annotations[key] = value
-		}
-	}
-	annotations[sSetInputHashName] = inputHash
-	statefulset := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        prefixedName(am.Name),
-			Labels:      config.Labels.Merge(am.ObjectMeta.Labels),
-			Annotations: annotations,
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion:         am.APIVersion,
-					BlockOwnerDeletion: &boolTrue,
-					Controller:         &boolTrue,
-					Kind:               am.Kind,
-					Name:               am.Name,
-					UID:                am.UID,
-				},
-			},
-		},
-		Spec: *spec,
-	}
+	statefulset := &appsv1.StatefulSet{Spec: *spec}
+	operator.UpdateObject(
+		statefulset,
+		operator.WithName(prefixedName(am.Name)),
+		operator.WithAnnotations(am.GetAnnotations()),
+		operator.WithAnnotations(config.Annotations),
+		operator.WithInputHashAnnotation(inputHash),
+		operator.WithLabels(am.GetLabels()),
+		operator.WithSelectorLabels(spec.Selector),
+		operator.WithLabels(config.Labels),
+		operator.WithManagingOwner(am),
+		operator.WithoutKubectlAnnotations(),
+	)
 
-	if am.Spec.ImagePullSecrets != nil && len(am.Spec.ImagePullSecrets) > 0 {
+	if len(am.Spec.ImagePullSecrets) > 0 {
 		statefulset.Spec.Template.Spec.ImagePullSecrets = am.Spec.ImagePullSecrets
 	}
 
 	storageSpec := am.Spec.Storage
-	if storageSpec == nil {
-		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, v1.Volume{
+	switch {
+	case storageSpec == nil:
+		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, corev1.Volume{
 			Name: volumeName(am.Name),
-			VolumeSource: v1.VolumeSource{
-				EmptyDir: &v1.EmptyDirVolumeSource{},
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		})
-	} else if storageSpec.EmptyDir != nil {
-		emptyDir := storageSpec.EmptyDir
-		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, v1.Volume{
+
+	case storageSpec.EmptyDir != nil:
+		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, corev1.Volume{
 			Name: volumeName(am.Name),
-			VolumeSource: v1.VolumeSource{
-				EmptyDir: emptyDir,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: storageSpec.EmptyDir,
 			},
 		})
-	} else if storageSpec.Ephemeral != nil {
-		ephemeral := storageSpec.Ephemeral
-		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, v1.Volume{
+
+	case storageSpec.Ephemeral != nil:
+		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, corev1.Volume{
 			Name: volumeName(am.Name),
-			VolumeSource: v1.VolumeSource{
-				Ephemeral: ephemeral,
+			VolumeSource: corev1.VolumeSource{
+				Ephemeral: storageSpec.Ephemeral,
 			},
 		})
-	} else {
+
+	default: // storageSpec.VolumeClaimTemplate
 		pvcTemplate := operator.MakeVolumeClaimTemplate(storageSpec.VolumeClaimTemplate)
 		if pvcTemplate.Name == "" {
 			pvcTemplate.Name = volumeName(am.Name)
 		}
 		if storageSpec.VolumeClaimTemplate.Spec.AccessModes == nil {
-			pvcTemplate.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}
+			pvcTemplate.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
 		} else {
 			pvcTemplate.Spec.AccessModes = storageSpec.VolumeClaimTemplate.Spec.AccessModes
 		}
@@ -170,158 +214,222 @@ func makeStatefulSet(am *monitoringv1.Alertmanager, config Config, inputHash str
 
 	statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, am.Spec.Volumes...)
 
+	if am.Spec.PersistentVolumeClaimRetentionPolicy != nil {
+		statefulset.Spec.PersistentVolumeClaimRetentionPolicy = am.Spec.PersistentVolumeClaimRetentionPolicy
+	}
+
 	return statefulset, nil
 }
 
-func makeStatefulSetService(p *monitoringv1.Alertmanager, config Config) *v1.Service {
-
-	if p.Spec.PortName == "" {
-		p.Spec.PortName = defaultPortName
+func makeStatefulSetService(a *monitoringv1.Alertmanager, config Config) *corev1.Service {
+	if a.Spec.PortName == "" {
+		a.Spec.PortName = defaultPortName
 	}
 
-	svc := &v1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: governingServiceName,
-			Labels: config.Labels.Merge(map[string]string{
-				"operated-alertmanager": "true",
-			}),
-			OwnerReferences: []metav1.OwnerReference{
+	svc := &corev1.Service{
+		Spec: corev1.ServiceSpec{
+			ClusterIP:                corev1.ClusterIPNone,
+			PublishNotReadyAddresses: true,
+			Ports: []corev1.ServicePort{
 				{
-					Name:       p.GetName(),
-					Kind:       p.Kind,
-					APIVersion: p.APIVersion,
-					UID:        p.GetUID(),
-				},
-			},
-		},
-		Spec: v1.ServiceSpec{
-			ClusterIP: "None",
-			Ports: []v1.ServicePort{
-				{
-					Name:       p.Spec.PortName,
-					Port:       9093,
-					TargetPort: intstr.FromString(p.Spec.PortName),
-					Protocol:   v1.ProtocolTCP,
+					Name:       a.Spec.PortName,
+					Port:       alertmanagerWebPort,
+					TargetPort: intstr.FromString(a.Spec.PortName),
+					Protocol:   corev1.ProtocolTCP,
 				},
 				{
 					Name:       "tcp-mesh",
-					Port:       9094,
-					TargetPort: intstr.FromInt(9094),
-					Protocol:   v1.ProtocolTCP,
+					Port:       alertmanagerMeshPort,
+					TargetPort: intstr.FromString(alertmanagerMeshTCPPortName),
+					Protocol:   corev1.ProtocolTCP,
 				},
 				{
 					Name:       "udp-mesh",
-					Port:       9094,
-					TargetPort: intstr.FromInt(9094),
-					Protocol:   v1.ProtocolUDP,
+					Port:       alertmanagerMeshPort,
+					TargetPort: intstr.FromString(alertmanagerMeshUDPPortName),
+					Protocol:   corev1.ProtocolUDP,
 				},
 			},
 			Selector: map[string]string{
-				"app.kubernetes.io/name": "alertmanager",
+				operator.ApplicationNameLabelKey: applicationNameLabelValue,
 			},
 		},
 	}
+
+	operator.UpdateObject(
+		svc,
+		operator.WithName(defaultOperatedServiceName),
+		operator.WithAnnotations(config.Annotations),
+		operator.WithLabels(map[string]string{"operated-alertmanager": "true"}),
+		operator.WithLabels(config.Labels),
+		operator.WithOwner(a),
+	)
+
 	return svc
 }
 
-func makeStatefulSetSpec(a *monitoringv1.Alertmanager, config Config, tlsAssetSecrets []string) (*appsv1.StatefulSetSpec, error) {
+func makeStatefulSetSpec(logger *slog.Logger, a *monitoringv1.Alertmanager, config Config, tlsSecrets *operator.ShardedSecret) (*appsv1.StatefulSetSpec, error) {
 	amVersion := operator.StringValOrDefault(a.Spec.Version, operator.DefaultAlertmanagerVersion)
 	amImagePath, err := operator.BuildImagePath(
-		operator.StringPtrValOrDefault(a.Spec.Image, ""),
+		ptr.Deref(a.Spec.Image, ""),
 		operator.StringValOrDefault(a.Spec.BaseImage, config.AlertmanagerDefaultBaseImage),
 		amVersion,
 		operator.StringValOrDefault(a.Spec.Tag, ""),
 		operator.StringValOrDefault(a.Spec.SHA, ""),
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to build image path")
+		return nil, fmt.Errorf("failed to build image path: %w", err)
 	}
 
 	version, err := semver.ParseTolerant(amVersion)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse alertmanager version")
+		return nil, fmt.Errorf("failed to parse alertmanager version: %w", err)
 	}
 
-	amArgs := []string{
-		fmt.Sprintf("--config.file=%s", path.Join(alertmanagerConfigOutDir, alertmanagerConfigEnvsubstFilename)),
-		fmt.Sprintf("--storage.path=%s", alertmanagerStorageDir),
-		fmt.Sprintf("--data.retention=%s", a.Spec.Retention),
+	amArgs := []monitoringv1.Argument{
+		{Name: "config.file", Value: path.Join(alertmanagerConfigOutDir, alertmanagerConfigEnvsubstFilename)},
+		{Name: "storage.path", Value: alertmanagerStorageDir},
+		{Name: "data.retention", Value: string(a.Spec.Retention)},
 	}
 
 	if *a.Spec.Replicas == 1 && !a.Spec.ForceEnableClusterMode {
-		amArgs = append(amArgs, "--cluster.listen-address=")
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "cluster.listen-address=", Value: ""})
 	} else {
-		amArgs = append(amArgs, "--cluster.listen-address=[$(POD_IP)]:9094")
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "cluster.listen-address", Value: "[$(POD_IP)]:9094"})
 	}
 
 	if a.Spec.ListenLocal {
-		amArgs = append(amArgs, "--web.listen-address=127.0.0.1:9093")
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "web.listen-address", Value: "127.0.0.1:9093"})
 	} else {
-		amArgs = append(amArgs, "--web.listen-address=:9093")
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "web.listen-address", Value: ":9093"})
 	}
 
 	if a.Spec.ExternalURL != "" {
-		amArgs = append(amArgs, "--web.external-url="+a.Spec.ExternalURL)
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "web.external-url", Value: a.Spec.ExternalURL})
+	}
+
+	if version.GTE(semver.MustParse("0.27.0")) && len(a.Spec.EnableFeatures) > 0 {
+		amArgs = append(amArgs, monitoringv1.Argument{
+			Name:  "enable-feature",
+			Value: strings.Join(a.Spec.EnableFeatures[:], ","),
+		})
 	}
 
 	webRoutePrefix := "/"
 	if a.Spec.RoutePrefix != "" {
 		webRoutePrefix = a.Spec.RoutePrefix
 	}
-	amArgs = append(amArgs, fmt.Sprintf("--web.route-prefix=%v", webRoutePrefix))
+
+	amArgs = append(amArgs, monitoringv1.Argument{Name: "web.route-prefix", Value: webRoutePrefix})
+
+	web := a.Spec.Web
+	if version.GTE(semver.MustParse("0.17.0")) && web != nil && web.GetConcurrency != nil {
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "web.get-concurrency", Value: fmt.Sprintf("%d", *web.GetConcurrency)})
+	}
+
+	if version.GTE(semver.MustParse("0.17.0")) && web != nil && web.Timeout != nil {
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "web.timeout", Value: fmt.Sprintf("%d", *web.Timeout)})
+	}
+
+	limits := a.Spec.Limits
+	if version.GTE(semver.MustParse("0.28.0")) && limits != nil {
+		if limits.MaxSilences != nil {
+			amArgs = append(amArgs, monitoringv1.Argument{Name: "silences.max-silences", Value: fmt.Sprintf("%d", *limits.MaxSilences)})
+		}
+
+		if !limits.MaxPerSilenceBytes.IsEmpty() {
+			vBytes, _ := units.ParseBase2Bytes(string(*limits.MaxPerSilenceBytes))
+			amArgs = append(amArgs, monitoringv1.Argument{Name: "silences.max-per-silence-bytes", Value: fmt.Sprintf("%d", int64(vBytes))})
+		}
+
+	}
+
+	if version.GTE(semver.MustParse("0.30.0")) && a.Spec.MinReadySeconds != nil {
+		startDelayArg := monitoringv1.Argument{
+			Name:  "dispatch.start-delay",
+			Value: fmt.Sprintf("%ds", *a.Spec.MinReadySeconds),
+		}
+		if i := operator.ArgumentsIntersection([]monitoringv1.Argument{startDelayArg}, a.Spec.AdditionalArgs); len(i) == 0 {
+			amArgs = append(amArgs, startDelayArg)
+		}
+	}
 
 	if a.Spec.LogLevel != "" && a.Spec.LogLevel != "info" {
-		amArgs = append(amArgs, fmt.Sprintf("--log.level=%s", a.Spec.LogLevel))
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "log.level", Value: a.Spec.LogLevel})
 	}
 
 	if version.GTE(semver.MustParse("0.16.0")) {
 		if a.Spec.LogFormat != "" && a.Spec.LogFormat != "logfmt" {
-			amArgs = append(amArgs, fmt.Sprintf("--log.format=%s", a.Spec.LogFormat))
+			amArgs = append(amArgs, monitoringv1.Argument{Name: "log.format", Value: a.Spec.LogFormat})
 		}
 	}
 
 	if a.Spec.ClusterAdvertiseAddress != "" {
-		amArgs = append(amArgs, fmt.Sprintf("--cluster.advertise-address=%s", a.Spec.ClusterAdvertiseAddress))
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "cluster.advertise-address", Value: a.Spec.ClusterAdvertiseAddress})
 	}
 
 	if a.Spec.ClusterGossipInterval != "" {
-		amArgs = append(amArgs, fmt.Sprintf("--cluster.gossip-interval=%s", a.Spec.ClusterGossipInterval))
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "cluster.gossip-interval", Value: string(a.Spec.ClusterGossipInterval)})
 	}
 
 	if a.Spec.ClusterPushpullInterval != "" {
-		amArgs = append(amArgs, fmt.Sprintf("--cluster.pushpull-interval=%s", a.Spec.ClusterPushpullInterval))
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "cluster.pushpull-interval", Value: string(a.Spec.ClusterPushpullInterval)})
 	}
 
 	if a.Spec.ClusterPeerTimeout != "" {
-		amArgs = append(amArgs, fmt.Sprintf("--cluster.peer-timeout=%s", a.Spec.ClusterPeerTimeout))
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "cluster.peer-timeout", Value: string(a.Spec.ClusterPeerTimeout)})
+	}
+
+	if version.GTE(semver.MustParse("0.30.0")) {
+		// Default the peer name to the pod's own name (injected via the
+		// downward API as $(POD_NAME)). Users can override this default by
+		// setting `.spec.clusterPeerName` on the Alertmanager CR.
+		peerName := fmt.Sprintf("$(%s)", operator.PodNameEnvVar)
+		if a.Spec.ClusterPeerName != nil && *a.Spec.ClusterPeerName != "" {
+			peerName = *a.Spec.ClusterPeerName
+		}
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "cluster.peer-name", Value: peerName})
+	}
+
+	// If multiple Alertmanager clusters are deployed on the same cluster, it can happen
+	// that because pod IP addresses are recycled, an Alertmanager instance from cluster B
+	// connects with cluster A.
+	// --cluster.label flag was introduced in alertmanager v0.26, this helps to block
+	// any traffic that is not meant for the cluster.
+	if version.GTE(semver.MustParse("0.26.0")) {
+		clusterLabel := fmt.Sprintf("%s/%s", a.Namespace, a.Name)
+		if a.Spec.ClusterLabel != nil {
+			clusterLabel = *a.Spec.ClusterLabel
+		}
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "cluster.label", Value: clusterLabel})
 	}
 
 	isHTTPS := a.Spec.Web != nil && a.Spec.Web.TLSConfig != nil && version.GTE(semver.MustParse("0.22.0"))
 
-	livenessProbeHandler := v1.ProbeHandler{
-		HTTPGet: &v1.HTTPGetAction{
+	livenessProbeHandler := corev1.ProbeHandler{
+		HTTPGet: &corev1.HTTPGetAction{
 			Path: path.Clean(webRoutePrefix + "/-/healthy"),
 			Port: intstr.FromString(a.Spec.PortName),
 		},
 	}
 
-	readinessProbeHandler := v1.ProbeHandler{
-		HTTPGet: &v1.HTTPGetAction{
+	readinessProbeHandler := corev1.ProbeHandler{
+		HTTPGet: &corev1.HTTPGetAction{
 			Path: path.Clean(webRoutePrefix + "/-/ready"),
 			Port: intstr.FromString(a.Spec.PortName),
 		},
 	}
 
-	var livenessProbe *v1.Probe
-	var readinessProbe *v1.Probe
+	var livenessProbe *corev1.Probe
+	var readinessProbe *corev1.Probe
 	if !a.Spec.ListenLocal {
-		livenessProbe = &v1.Probe{
+		livenessProbe = &corev1.Probe{
 			ProbeHandler:     livenessProbeHandler,
 			TimeoutSeconds:   probeTimeoutSeconds,
 			FailureThreshold: 10,
 		}
 
-		readinessProbe = &v1.Probe{
+		readinessProbe = &corev1.Probe{
 			ProbeHandler:        readinessProbeHandler,
 			InitialDelaySeconds: 3,
 			TimeoutSeconds:      3,
@@ -330,154 +438,91 @@ func makeStatefulSetSpec(a *monitoringv1.Alertmanager, config Config, tlsAssetSe
 		}
 
 		if isHTTPS {
-			livenessProbe.HTTPGet.Scheme = v1.URISchemeHTTPS
-			readinessProbe.HTTPGet.Scheme = v1.URISchemeHTTPS
+			livenessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
+			readinessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
 		}
 	}
 
 	podAnnotations := map[string]string{}
 	podLabels := map[string]string{
-		"app.kubernetes.io/version": version.String(),
+		operator.ApplicationVersionLabelKey: version.String(),
 	}
 	// In cases where an existing selector label is modified, or a new one is added, new sts cannot match existing pods.
 	// We should try to avoid removing such immutable fields whenever possible since doing
 	// so forces us to enter the 'recreate cycle' and can potentially lead to downtime.
 	// The requirement to make a change here should be carefully evaluated.
-	podSelectorLabels := map[string]string{
-		"app.kubernetes.io/name":       "alertmanager",
-		"app.kubernetes.io/managed-by": "prometheus-operator",
-		"app.kubernetes.io/instance":   a.Name,
-		"alertmanager":                 a.Name,
-	}
+	podSelectorLabels := makeSelectorLabels(a.GetObjectMeta().GetName())
 	if a.Spec.PodMetadata != nil {
-		if a.Spec.PodMetadata.Labels != nil {
-			for k, v := range a.Spec.PodMetadata.Labels {
-				podLabels[k] = v
-			}
-		}
-		if a.Spec.PodMetadata.Annotations != nil {
-			for k, v := range a.Spec.PodMetadata.Annotations {
-				podAnnotations[k] = v
-			}
-		}
+		maps.Copy(podLabels, a.Spec.PodMetadata.Labels)
+		maps.Copy(podAnnotations, a.Spec.PodMetadata.Annotations)
 	}
-	for k, v := range podSelectorLabels {
-		podLabels[k] = v
-	}
+	maps.Copy(podLabels, podSelectorLabels)
 
-	podAnnotations["kubectl.kubernetes.io/default-container"] = "alertmanager"
+	podAnnotations[operator.DefaultContainerAnnotationKey] = "alertmanager"
 
-	var operatorInitContainers []v1.Container
+	var operatorInitContainers []corev1.Container
 
 	var clusterPeerDomain string
 	if config.ClusterDomain != "" {
-		clusterPeerDomain = fmt.Sprintf("%s.%s.svc.%s.", governingServiceName, a.Namespace, config.ClusterDomain)
+		clusterPeerDomain = fmt.Sprintf("%s.%s.svc.%s.", getServiceName(a), a.Namespace, config.ClusterDomain)
 	} else {
 		// The default DNS search path is .svc.<cluster domain>
-		clusterPeerDomain = governingServiceName
+		clusterPeerDomain = getServiceName(a)
 	}
 	for i := int32(0); i < *a.Spec.Replicas; i++ {
-		amArgs = append(amArgs, fmt.Sprintf("--cluster.peer=%s-%d.%s:9094", prefixedName(a.Name), i, clusterPeerDomain))
+		amArgs = append(amArgs, monitoringv1.Argument{
+			Name:  "cluster.peer",
+			Value: fmt.Sprintf("%s-%d.%s:9094", prefixedName(a.Name), i, clusterPeerDomain),
+		})
 	}
 
 	for _, peer := range a.Spec.AdditionalPeers {
-		amArgs = append(amArgs, fmt.Sprintf("--cluster.peer=%s", peer))
+		amArgs = append(amArgs, monitoringv1.Argument{Name: "cluster.peer", Value: peer})
 	}
 
-	ports := []v1.ContainerPort{
+	ports := []corev1.ContainerPort{
 		{
-			Name:          "mesh-tcp",
-			ContainerPort: 9094,
-			Protocol:      v1.ProtocolTCP,
+			Name:          alertmanagerMeshTCPPortName,
+			ContainerPort: alertmanagerMeshPort,
+			Protocol:      corev1.ProtocolTCP,
 		},
 		{
-			Name:          "mesh-udp",
-			ContainerPort: 9094,
-			Protocol:      v1.ProtocolUDP,
+			Name:          alertmanagerMeshUDPPortName,
+			ContainerPort: alertmanagerMeshPort,
+			Protocol:      corev1.ProtocolUDP,
 		},
 	}
 	if !a.Spec.ListenLocal {
-		ports = append([]v1.ContainerPort{
+		ports = append([]corev1.ContainerPort{
 			{
 				Name:          a.Spec.PortName,
-				ContainerPort: 9093,
-				Protocol:      v1.ProtocolTCP,
+				ContainerPort: alertmanagerWebPort,
+				Protocol:      corev1.ProtocolTCP,
 			},
 		}, ports...)
 	}
 
-	// Adjust Alertmanager command line args to specified AM version
-	//
-	// Alertmanager versions < v0.15.0 are only supported on a best effort basis
-	// starting with Prometheus Operator v0.30.0.
-	switch version.Major {
-	case 0:
-		if version.Minor < 15 {
-			for i := range amArgs {
-				// below Alertmanager v0.15.0 peer address port specification is not necessary
-				if strings.Contains(amArgs[i], "--cluster.peer") {
-					amArgs[i] = strings.TrimSuffix(amArgs[i], ":9094")
-				}
+	// Override default 6h value to allow AlertManager cluster to
+	// quickly remove a cluster member after its pod restarted or during a
+	// regular rolling update.
+	amArgs = append(amArgs, monitoringv1.Argument{Name: "cluster.reconnect-timeout", Value: "5m"})
 
-				// below Alertmanager v0.15.0 high availability flags are prefixed with 'mesh' instead of 'cluster'
-				amArgs[i] = strings.Replace(amArgs[i], "--cluster.", "--mesh.", 1)
-			}
-		} else {
-			// reconnect-timeout was added in 0.15 (https://github.com/prometheus/alertmanager/pull/1384)
-			// Override default 6h value to allow AlertManager cluster to
-			// quickly remove a cluster member after its pod restarted or during a
-			// regular rolling update.
-			amArgs = append(amArgs, "--cluster.reconnect-timeout=5m")
-		}
-		if version.Minor < 13 {
-			for i := range amArgs {
-				// below Alertmanager v0.13.0 all flags are with single dash.
-				amArgs[i] = strings.Replace(amArgs[i], "--", "-", 1)
-			}
-		}
-		if version.Minor < 7 {
-			// below Alertmanager v0.7.0 the flag 'web.route-prefix' does not exist
-			amArgs = filter(amArgs, func(s string) bool {
-				return !strings.Contains(s, "web.route-prefix")
-			})
-		}
-	default:
-		return nil, errors.Errorf("unsupported Alertmanager major version %s", version)
-	}
-
-	assetsVolume := v1.Volume{
-		Name: tlsAssetsVolumeName,
-		VolumeSource: v1.VolumeSource{
-			Projected: &v1.ProjectedVolumeSource{
-				Sources: []v1.VolumeProjection{},
-			},
-		},
-	}
-	for _, assetShard := range tlsAssetSecrets {
-		assetsVolume.Projected.Sources = append(assetsVolume.Projected.Sources,
-			v1.VolumeProjection{
-				Secret: &v1.SecretProjection{
-					LocalObjectReference: v1.LocalObjectReference{Name: assetShard},
-				},
-			})
-	}
-
-	volumes := []v1.Volume{
+	volumes := []corev1.Volume{
 		{
 			Name: alertmanagerConfigVolumeName,
-			VolumeSource: v1.VolumeSource{
-				Secret: &v1.SecretVolumeSource{
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
 					SecretName: generatedConfigSecretName(a.Name),
 				},
 			},
 		},
-		assetsVolume,
+		tlsSecrets.Volume(tlsAssetsVolumeName),
 		{
 			Name: alertmanagerConfigOutVolumeName,
-			VolumeSource: v1.VolumeSource{
-				EmptyDir: &v1.EmptyDirVolumeSource{
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
 					// tmpfs is used here to avoid writing sensitive data into disk.
-					Medium: v1.StorageMediumMemory,
+					Medium: corev1.StorageMediumMemory,
 				},
 			},
 		},
@@ -490,7 +535,7 @@ func makeStatefulSetSpec(a *monitoringv1.Alertmanager, config Config, tlsAssetSe
 		}
 	}
 
-	amVolumeMounts := []v1.VolumeMount{
+	amVolumeMounts := []corev1.VolumeMount{
 		{
 			Name:      alertmanagerConfigVolumeName,
 			MountPath: alertmanagerConfigDir,
@@ -512,55 +557,10 @@ func makeStatefulSetSpec(a *monitoringv1.Alertmanager, config Config, tlsAssetSe
 		},
 	}
 
-	amCfg := a.Spec.AlertmanagerConfiguration
-	if amCfg != nil && len(amCfg.Templates) > 0 {
-		sources := []v1.VolumeProjection{}
-		for _, v := range amCfg.Templates {
-			if v.ConfigMap != nil {
-				sources = append(sources, v1.VolumeProjection{
-					ConfigMap: &v1.ConfigMapProjection{
-						LocalObjectReference: v1.LocalObjectReference{
-							Name: v.ConfigMap.Name,
-						},
-						Items: []v1.KeyToPath{{
-							Key:  v.ConfigMap.Key,
-							Path: v.ConfigMap.Key,
-						}},
-					},
-				})
+	var configReloaderWebConfigFile string
 
-			}
-			if v.Secret != nil {
-				sources = append(sources, v1.VolumeProjection{
-					Secret: &v1.SecretProjection{
-						LocalObjectReference: v1.LocalObjectReference{
-							Name: v.Secret.Name,
-						},
-						Items: []v1.KeyToPath{{
-							Key:  v.Secret.Key,
-							Path: v.Secret.Key,
-						}},
-					},
-				})
-			}
-		}
-		volumes = append(volumes, v1.Volume{
-			Name: "notification-templates",
-			VolumeSource: v1.VolumeSource{
-				Projected: &v1.ProjectedVolumeSource{
-					Sources: sources,
-				},
-			},
-		})
-		amVolumeMounts = append(amVolumeMounts, v1.VolumeMount{
-			Name:      alertmanagerTemplatesVolumeName,
-			ReadOnly:  true,
-			MountPath: alertmanagerTemplatesDir,
-		})
-	}
-
-	watchedDirectories := []string{}
-	configReloaderVolumeMounts := []v1.VolumeMount{
+	watchedDirectories := []string{alertmanagerConfigDir}
+	configReloaderVolumeMounts := []corev1.VolumeMount{
 		{
 			Name:      alertmanagerConfigVolumeName,
 			MountPath: alertmanagerConfigDir,
@@ -572,23 +572,86 @@ func makeStatefulSetSpec(a *monitoringv1.Alertmanager, config Config, tlsAssetSe
 		},
 	}
 
-	rn := k8sutil.NewResourceNamerWithPrefix("secret")
+	amCfg := a.Spec.AlertmanagerConfiguration
+	if amCfg != nil && len(amCfg.Templates) > 0 {
+		sources := []corev1.VolumeProjection{}
+		keys := sets.Set[string]{}
+		for _, v := range amCfg.Templates {
+			if v.ConfigMap != nil {
+				if keys.Has(v.ConfigMap.Key) {
+					logger.Debug(fmt.Sprintf("skipping %q due to duplicate key %q", v.ConfigMap.Key, v.ConfigMap.Name))
+					continue
+				}
+				sources = append(sources, corev1.VolumeProjection{
+					ConfigMap: &corev1.ConfigMapProjection{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: v.ConfigMap.Name,
+						},
+						Items: []corev1.KeyToPath{{
+							Key:  v.ConfigMap.Key,
+							Path: v.ConfigMap.Key,
+						}},
+					},
+				})
+				keys.Insert(v.ConfigMap.Key)
+			}
+			if v.Secret != nil {
+				if keys.Has(v.Secret.Key) {
+					logger.Debug(fmt.Sprintf("skipping %q due to duplicate key %q", v.Secret.Key, v.Secret.Name))
+					continue
+				}
+				sources = append(sources, corev1.VolumeProjection{
+					Secret: &corev1.SecretProjection{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: v.Secret.Name,
+						},
+						Items: []corev1.KeyToPath{{
+							Key:  v.Secret.Key,
+							Path: v.Secret.Key,
+						}},
+					},
+				})
+				keys.Insert(v.Secret.Key)
+			}
+		}
+		volumes = append(volumes, corev1.Volume{
+			Name: "notification-templates",
+			VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{
+					Sources: sources,
+				},
+			},
+		})
+		amVolumeMounts = append(amVolumeMounts, corev1.VolumeMount{
+			Name:      alertmanagerTemplatesVolumeName,
+			ReadOnly:  true,
+			MountPath: alertmanagerTemplatesDir,
+		})
+		configReloaderVolumeMounts = append(configReloaderVolumeMounts, corev1.VolumeMount{
+			Name:      alertmanagerTemplatesVolumeName,
+			ReadOnly:  true,
+			MountPath: alertmanagerTemplatesDir,
+		})
+		watchedDirectories = append(watchedDirectories, alertmanagerTemplatesDir)
+	}
+
+	rn := k8s.NewResourceNamerWithPrefix("secret")
 	for _, s := range a.Spec.Secrets {
 		name, err := rn.DNS1123Label(s)
 		if err != nil {
 			return nil, err
 		}
 
-		volumes = append(volumes, v1.Volume{
+		volumes = append(volumes, corev1.Volume{
 			Name: name,
-			VolumeSource: v1.VolumeSource{
-				Secret: &v1.SecretVolumeSource{
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
 					SecretName: s,
 				},
 			},
 		})
 		mountPath := path.Join(secretsDir, s)
-		mount := v1.VolumeMount{
+		mount := corev1.VolumeMount{
 			Name:      name,
 			ReadOnly:  true,
 			MountPath: mountPath,
@@ -598,25 +661,25 @@ func makeStatefulSetSpec(a *monitoringv1.Alertmanager, config Config, tlsAssetSe
 		watchedDirectories = append(watchedDirectories, mountPath)
 	}
 
-	rn = k8sutil.NewResourceNamerWithPrefix("configmap")
+	rn = k8s.NewResourceNamerWithPrefix("configmap")
 	for _, c := range a.Spec.ConfigMaps {
 		name, err := rn.DNS1123Label(c)
 		if err != nil {
 			return nil, err
 		}
 
-		volumes = append(volumes, v1.Volume{
+		volumes = append(volumes, corev1.Volume{
 			Name: name,
-			VolumeSource: v1.VolumeSource{
-				ConfigMap: &v1.ConfigMapVolumeSource{
-					LocalObjectReference: v1.LocalObjectReference{
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
 						Name: c,
 					},
 				},
 			},
 		})
 		mountPath := path.Join(configmapsDir, c)
-		mount := v1.VolumeMount{
+		mount := corev1.VolumeMount{
 			Name:      name,
 			ReadOnly:  true,
 			MountPath: mountPath,
@@ -647,53 +710,88 @@ func makeStatefulSetSpec(a *monitoringv1.Alertmanager, config Config, tlsAssetSe
 		if err != nil {
 			return nil, err
 		}
-		amArgs = append(amArgs, fmt.Sprintf("--%s=%s", confArg.Name, confArg.Value))
+		amArgs = append(amArgs, monitoringv1.Argument{Name: confArg.Name, Value: confArg.Value})
+		volumes = append(volumes, configVol...)
+		amVolumeMounts = append(amVolumeMounts, configMount...)
+
+		configReloaderWebConfigFile = confArg.Value
+		configReloaderVolumeMounts = append(configReloaderVolumeMounts, configMount...)
+	}
+
+	if version.GTE(semver.MustParse("0.24.0")) {
+		clusterTLSConfig, err := clustertlsconfig.New(clusterTLSConfigDir, a)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create the cluster TLS configuration: %w", err)
+		}
+
+		confArg, configVol, configMount, err := clusterTLSConfig.GetMountParameters()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get mount parameters for cluster TLS configuration: %w", err)
+		}
+
+		// confArg is nil if the Alertmanager resource doesn't configure mTLS for the cluster protocol.
+		if confArg != nil {
+			amArgs = append(amArgs, monitoringv1.Argument{Name: confArg.Name, Value: confArg.Value})
+		}
 		volumes = append(volumes, configVol...)
 		amVolumeMounts = append(amVolumeMounts, configMount...)
 	}
 
-	terminationGracePeriod := int64(120)
 	finalSelectorLabels := config.Labels.Merge(podSelectorLabels)
 	finalLabels := config.Labels.Merge(podLabels)
 
-	boolFalse := false
-	boolTrue := true
 	alertmanagerURIScheme := "http"
 	if isHTTPS {
 		alertmanagerURIScheme = "https"
 	}
 
-	defaultContainers := []v1.Container{
-		{
-			Args:            amArgs,
-			Name:            "alertmanager",
-			Image:           amImagePath,
-			ImagePullPolicy: a.Spec.ImagePullPolicy,
-			Ports:           ports,
-			VolumeMounts:    amVolumeMounts,
-			LivenessProbe:   livenessProbe,
-			ReadinessProbe:  readinessProbe,
-			Resources:       a.Spec.Resources,
-			SecurityContext: &v1.SecurityContext{
-				AllowPrivilegeEscalation: &boolFalse,
-				ReadOnlyRootFilesystem:   &boolTrue,
-				Capabilities: &v1.Capabilities{
-					Drop: []v1.Capability{"ALL"},
-				},
+	containerArgs, err := operator.BuildArgs(amArgs, a.Spec.AdditionalArgs)
+	if err != nil {
+		return nil, err
+	}
+
+	alertmanagerContainer := corev1.Container{
+		Args:            containerArgs,
+		Name:            "alertmanager",
+		Image:           amImagePath,
+		ImagePullPolicy: a.Spec.ImagePullPolicy,
+		Ports:           ports,
+		VolumeMounts:    amVolumeMounts,
+		LivenessProbe:   livenessProbe,
+		ReadinessProbe:  readinessProbe,
+		Resources:       a.Spec.Resources,
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: new(false),
+			ReadOnlyRootFilesystem:   new(true),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
 			},
-			Env: []v1.EnvVar{
-				{
-					// Necessary for '--cluster.listen-address' flag
-					Name: "POD_IP",
-					ValueFrom: &v1.EnvVarSource{
-						FieldRef: &v1.ObjectFieldSelector{
-							FieldPath: "status.podIP",
-						},
+		},
+		Env: []corev1.EnvVar{
+			{
+				// Necessary for '--cluster.listen-address' flag
+				Name: "POD_IP",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{
+						FieldPath: "status.podIP",
 					},
 				},
 			},
-			TerminationMessagePolicy: v1.TerminationMessageFallbackToLogsOnError,
 		},
+		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+	}
+
+	if version.GTE(semver.MustParse("0.30.0")) {
+		alertmanagerContainer.Env = append(alertmanagerContainer.Env, corev1.EnvVar{
+			Name: operator.PodNameEnvVar,
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		})
+	}
+
+	defaultContainers := []corev1.Container{
+		alertmanagerContainer,
 		operator.CreateConfigReloader(
 			"config-reloader",
 			operator.ReloaderConfig(config.ReloaderConfig),
@@ -709,27 +807,23 @@ func makeStatefulSetSpec(a *monitoringv1.Alertmanager, config Config, tlsAssetSe
 			operator.WatchedDirectories(watchedDirectories),
 			operator.VolumeMounts(configReloaderVolumeMounts),
 			operator.Shard(-1),
+			operator.WebConfigFile(configReloaderWebConfigFile),
 			operator.ConfigFile(path.Join(alertmanagerConfigDir, alertmanagerConfigFileCompressed)),
 			operator.ConfigEnvsubstFile(path.Join(alertmanagerConfigOutDir, alertmanagerConfigEnvsubstFilename)),
 			operator.ImagePullPolicy(a.Spec.ImagePullPolicy),
 		),
 	}
 
-	containers, err := k8sutil.MergePatchContainers(defaultContainers, a.Spec.Containers)
+	containers, err := k8s.MergePatchContainers(defaultContainers, a.Spec.Containers)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to merge containers spec")
-	}
-
-	var minReadySeconds int32
-	if a.Spec.MinReadySeconds != nil {
-		minReadySeconds = int32(*a.Spec.MinReadySeconds)
+		return nil, fmt.Errorf("failed to merge containers spec: %w", err)
 	}
 
 	operatorInitContainers = append(operatorInitContainers,
 		operator.CreateConfigReloader(
 			"init-config-reloader",
 			operator.ReloaderConfig(config.ReloaderConfig),
-			operator.ReloaderRunOnce(),
+			operator.InitContainer(),
 			operator.LogFormat(a.Spec.LogFormat),
 			operator.LogLevel(a.Spec.LogLevel),
 			operator.WatchedDirectories(watchedDirectories),
@@ -741,33 +835,37 @@ func makeStatefulSetSpec(a *monitoringv1.Alertmanager, config Config, tlsAssetSe
 		),
 	)
 
-	initContainers, err := k8sutil.MergePatchContainers(operatorInitContainers, a.Spec.InitContainers)
+	initContainers, err := k8s.MergePatchContainers(operatorInitContainers, a.Spec.InitContainers)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to merge init containers spec")
+		return nil, fmt.Errorf("failed to merge init containers spec: %w", err)
 	}
 
-	// PodManagementPolicy is set to Parallel to mitigate issues in kubernetes: https://github.com/kubernetes/kubernetes/issues/60164
-	// This is also mentioned as one of limitations of StatefulSets: https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#limitations
-	return &appsv1.StatefulSetSpec{
-		ServiceName:         governingServiceName,
+	// By default, podManagementPolicy is set to Parallel to mitigate rollout
+	// issues in Kubernetes (see https://github.com/kubernetes/kubernetes/issues/60164).
+	// This is also mentioned as one of limitations of StatefulSets:
+	// https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#limitations
+	podManagementPolicy := ptr.Deref(a.Spec.PodManagementPolicy, monitoringv1.ParallelPodManagement)
+
+	spec := appsv1.StatefulSetSpec{
+		ServiceName:         getServiceName(a),
 		Replicas:            a.Spec.Replicas,
-		MinReadySeconds:     minReadySeconds,
-		PodManagementPolicy: appsv1.ParallelPodManagement,
-		UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
-			Type: appsv1.RollingUpdateStatefulSetStrategyType,
-		},
+		MinReadySeconds:     ptr.Deref(a.Spec.MinReadySeconds, 0),
+		PodManagementPolicy: appsv1.PodManagementPolicyType(podManagementPolicy),
+		UpdateStrategy:      operator.UpdateStrategyForStatefulSet(a.Spec.UpdateStrategy),
 		Selector: &metav1.LabelSelector{
 			MatchLabels: finalSelectorLabels,
 		},
-		Template: v1.PodTemplateSpec{
+		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      finalLabels,
 				Annotations: podAnnotations,
 			},
-			Spec: v1.PodSpec{
+			Spec: corev1.PodSpec{
+				AutomountServiceAccountToken:  a.Spec.AutomountServiceAccountToken,
 				NodeSelector:                  a.Spec.NodeSelector,
+				SchedulerName:                 a.Spec.SchedulerName,
 				PriorityClassName:             a.Spec.PriorityClassName,
-				TerminationGracePeriodSeconds: &terminationGracePeriod,
+				TerminationGracePeriodSeconds: new(ptr.Deref(a.Spec.TerminationGracePeriodSeconds, defaultTerminationGracePeriodSeconds)),
 				InitContainers:                initContainers,
 				Containers:                    containers,
 				Volumes:                       volumes,
@@ -777,9 +875,19 @@ func makeStatefulSetSpec(a *monitoringv1.Alertmanager, config Config, tlsAssetSe
 				Affinity:                      a.Spec.Affinity,
 				TopologySpreadConstraints:     a.Spec.TopologySpreadConstraints,
 				HostAliases:                   operator.MakeHostAliases(a.Spec.HostAliases),
+				EnableServiceLinks:            a.Spec.EnableServiceLinks,
+				HostUsers:                     a.Spec.HostUsers,
+				HostNetwork:                   a.Spec.HostNetwork,
 			},
 		},
-	}, nil
+	}
+
+	if a.Spec.HostNetwork {
+		spec.Template.Spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
+	}
+	k8s.UpdateDNSPolicy(&spec.Template.Spec, a.Spec.DNSPolicy)
+	k8s.UpdateDNSConfig(&spec.Template.Spec, a.Spec.DNSConfig)
+	return &spec, nil
 }
 
 func defaultConfigSecretName(am *monitoringv1.Alertmanager) string {
@@ -817,14 +925,4 @@ func subPathForStorage(s *monitoringv1.StorageSpec) string {
 	}
 
 	return "alertmanager-db"
-}
-
-func filter(strings []string, f func(string) bool) []string {
-	filteredStrings := make([]string, 0)
-	for _, s := range strings {
-		if f(s) {
-			filteredStrings = append(filteredStrings, s)
-		}
-	}
-	return filteredStrings
 }

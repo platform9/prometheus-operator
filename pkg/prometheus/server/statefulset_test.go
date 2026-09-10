@@ -1,4 +1,4 @@
-// Copyright 2016 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,69 +15,55 @@
 package prometheus
 
 import (
+	"context"
 	"fmt"
-	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/kylelemons/godebug/pretty"
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
-	prompkg "github.com/prometheus-operator/prometheus-operator/pkg/prometheus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/pointer"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
+	prompkg "github.com/prometheus-operator/prometheus-operator/pkg/prometheus"
 )
 
-var (
-	defaultTestConfig = &operator.Config{
-		LocalHost:                  "localhost",
-		ReloaderConfig:             operator.DefaultReloaderTestConfig.ReloaderConfig,
-		PrometheusDefaultBaseImage: operator.DefaultPrometheusBaseImage,
-		ThanosDefaultBaseImage:     operator.DefaultThanosBaseImage,
-	}
-)
-
-func newLogger() log.Logger {
-	return level.NewFilter(log.NewLogfmtLogger(os.Stderr), level.AllowWarn())
+var defaultTestConfig = prompkg.Config{
+	LocalHost:                  "localhost",
+	ReloaderConfig:             operator.DefaultReloaderTestConfig.ReloaderConfig,
+	PrometheusDefaultBaseImage: operator.DefaultPrometheusBaseImage,
+	ThanosDefaultBaseImage:     operator.DefaultThanosBaseImage,
 }
 
 func makeStatefulSetFromPrometheus(p monitoringv1.Prometheus) (*appsv1.StatefulSet, error) {
-	logger := newLogger()
+	logger := prompkg.NewLogger()
 
-	cg, err := prompkg.NewConfigGenerator(logger, &p, false)
+	cg, err := prompkg.NewConfigGenerator(logger, &p)
 	if err != nil {
 		return nil, err
 	}
 
 	return makeStatefulSet(
-		logger,
 		"test",
 		&p,
-		p.Spec.BaseImage, p.Spec.Tag, p.Spec.SHA,
-		p.Spec.Retention,
-		p.Spec.RetentionSize,
-		p.Spec.Rules,
-		p.Spec.Query,
-		p.Spec.AllowOverlappingBlocks,
-		p.Spec.EnableAdminAPI,
-		p.Spec.QueryLogFile,
-		p.Spec.Thanos,
-		p.Spec.DisableCompaction,
 		defaultTestConfig,
 		cg,
 		nil,
-		"",
+		"abc",
 		0,
-		nil)
+		&operator.ShardedSecret{})
 }
 
 func TestStatefulSetLabelingAndAnnotations(t *testing.T) {
@@ -89,52 +75,49 @@ func TestStatefulSetLabelingAndAnnotations(t *testing.T) {
 		"kubectl.kubernetes.io/last-applied-configuration": "something",
 		"kubectl.kubernetes.io/something":                  "something",
 	}
+
 	// kubectl annotations must not be on the statefulset so kubectl does
 	// not manage the generated object
 	expectedStatefulSetAnnotations := map[string]string{
-		"prometheus-operator-input-hash": "",
+		"prometheus-operator-input-hash": "abc",
 		"testannotation":                 "testannotationvalue",
 	}
 
 	expectedStatefulSetLabels := map[string]string{
 		"testlabel":                    "testlabelvalue",
-		"operator.prometheus.io/name":  "",
+		"operator.prometheus.io/name":  "test",
 		"operator.prometheus.io/shard": "0",
 		"operator.prometheus.io/mode":  "server",
+		"managed-by":                   "prometheus-operator",
+		"prometheus":                   "test",
+		"app.kubernetes.io/instance":   "test",
+		"app.kubernetes.io/managed-by": "prometheus-operator",
+		"app.kubernetes.io/name":       "prometheus",
 	}
 
 	expectedPodLabels := map[string]string{
-		"prometheus":                   "",
+		"prometheus":                   "test",
 		"app.kubernetes.io/name":       "prometheus",
 		"app.kubernetes.io/version":    strings.TrimPrefix(operator.DefaultPrometheusVersion, "v"),
 		"app.kubernetes.io/managed-by": "prometheus-operator",
-		"app.kubernetes.io/instance":   "",
-		"operator.prometheus.io/name":  "",
+		"app.kubernetes.io/instance":   "test",
+		"operator.prometheus.io/name":  "test",
 		"operator.prometheus.io/shard": "0",
 	}
 
 	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test",
+			Namespace:   "ns",
 			Labels:      labels,
 			Annotations: annotations,
 		},
 	})
 	require.NoError(t, err)
 
-	if !reflect.DeepEqual(expectedStatefulSetLabels, sset.Labels) {
-		t.Log(pretty.Compare(expectedStatefulSetLabels, sset.Labels))
-		t.Fatal("Labels are not properly being propagated to the StatefulSet")
-	}
-
-	if !reflect.DeepEqual(expectedStatefulSetAnnotations, sset.Annotations) {
-		t.Log(pretty.Compare(expectedStatefulSetAnnotations, sset.Annotations))
-		t.Fatal("Annotations are not properly being propagated to the StatefulSet")
-	}
-
-	if !reflect.DeepEqual(expectedPodLabels, sset.Spec.Template.ObjectMeta.Labels) {
-		t.Log(pretty.Compare(expectedPodLabels, sset.Spec.Template.ObjectMeta.Labels))
-		t.Fatal("Labels are not properly being propagated to the Pod")
-	}
+	require.Equalf(t, expectedStatefulSetLabels, sset.Labels, "Labels are not properly being propagated to the StatefulSet\n%s", pretty.Compare(expectedStatefulSetLabels, sset.Labels))
+	require.Equalf(t, expectedStatefulSetAnnotations, sset.Annotations, "Annotations are not properly being propagated to the StatefulSet\n%s", pretty.Compare(expectedStatefulSetAnnotations, sset.Annotations))
+	require.Equalf(t, expectedPodLabels, sset.Spec.Template.ObjectMeta.Labels, "Labels are not properly being propagated to the Pod\n%s", pretty.Compare(expectedPodLabels, sset.Spec.Template.ObjectMeta.Labels))
 }
 
 func TestPodLabelsAnnotations(t *testing.T) {
@@ -158,13 +141,13 @@ func TestPodLabelsAnnotations(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	if val, ok := sset.Spec.Template.ObjectMeta.Labels["testlabel"]; !ok || val != "testvalue" {
-		t.Fatal("Pod labels are not properly propagated")
-	}
-	if val, ok := sset.Spec.Template.ObjectMeta.Annotations["testannotation"]; !ok || val != "testvalue" {
-		t.Fatal("Pod annotations are not properly propagated")
-	}
+	valLabel := sset.Spec.Template.ObjectMeta.Labels["testlabel"]
+	require.Equal(t, "testvalue", valLabel, "Pod labels are not properly propagated")
+
+	valAnnotation := sset.Spec.Template.ObjectMeta.Annotations["testannotation"]
+	require.Equal(t, "testvalue", valAnnotation, "Pod annotations are not properly propagated")
 }
+
 func TestPodLabelsShouldNotBeSelectorLabels(t *testing.T) {
 	labels := map[string]string{
 		"testlabel": "testvalue",
@@ -181,9 +164,7 @@ func TestPodLabelsShouldNotBeSelectorLabels(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	if sset.Spec.Selector.MatchLabels["testlabel"] == "testvalue" {
-		t.Fatal("Pod Selector are not properly propagated")
-	}
+	require.NotEqual(t, "testvalue", sset.Spec.Selector.MatchLabels["testlabel"], "Pod Selector are not properly propagated")
 }
 
 func TestStatefulSetPVC(t *testing.T) {
@@ -200,8 +181,8 @@ func TestStatefulSetPVC(t *testing.T) {
 		EmbeddedObjectMetadata: monitoringv1.EmbeddedObjectMetadata{
 			Annotations: annotations,
 		},
-		Spec: v1.PersistentVolumeClaimSpec{
-			AccessModes:      []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			StorageClassName: &storageClass,
 		},
 	}
@@ -222,10 +203,7 @@ func TestStatefulSetPVC(t *testing.T) {
 	require.NoError(t, err)
 
 	ssetPvc := sset.Spec.VolumeClaimTemplates[0]
-	if !reflect.DeepEqual(*pvc.Spec.StorageClassName, *ssetPvc.Spec.StorageClassName) {
-		t.Fatal("Error adding PVC Spec to StatefulSetSpec")
-	}
-
+	require.Equal(t, *pvc.Spec.StorageClassName, *ssetPvc.Spec.StorageClassName, "Error adding PVC Spec to StatefulSetSpec")
 }
 
 func TestStatefulSetEmptyDir(t *testing.T) {
@@ -236,8 +214,8 @@ func TestStatefulSetEmptyDir(t *testing.T) {
 		"testannotation": "testannotationvalue",
 	}
 
-	emptyDir := v1.EmptyDirVolumeSource{
-		Medium: v1.StorageMediumMemory,
+	emptyDir := corev1.EmptyDirVolumeSource{
+		Medium: corev1.StorageMediumMemory,
 	}
 
 	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
@@ -256,9 +234,8 @@ func TestStatefulSetEmptyDir(t *testing.T) {
 	require.NoError(t, err)
 
 	ssetVolumes := sset.Spec.Template.Spec.Volumes
-	if ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir == nil || !reflect.DeepEqual(emptyDir.Medium, ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir.Medium) {
-		t.Fatal("Error adding EmptyDir Spec to StatefulSetSpec")
-	}
+	require.NotNil(t, ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir, "Error adding EmptyDir Spec to StatefulSetSpec")
+	require.Equal(t, emptyDir.Medium, ssetVolumes[len(ssetVolumes)-1].VolumeSource.EmptyDir.Medium, "Error adding EmptyDir Spec to StatefulSetSpec")
 }
 
 func TestStatefulSetEphemeral(t *testing.T) {
@@ -271,10 +248,10 @@ func TestStatefulSetEphemeral(t *testing.T) {
 
 	storageClass := "storageclass"
 
-	ephemeral := v1.EphemeralVolumeSource{
-		VolumeClaimTemplate: &v1.PersistentVolumeClaimTemplate{
-			Spec: v1.PersistentVolumeClaimSpec{
-				AccessModes:      []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+	ephemeral := corev1.EphemeralVolumeSource{
+		VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 				StorageClassName: &storageClass,
 			},
 		},
@@ -296,10 +273,8 @@ func TestStatefulSetEphemeral(t *testing.T) {
 	require.NoError(t, err)
 
 	ssetVolumes := sset.Spec.Template.Spec.Volumes
-	if ssetVolumes[len(ssetVolumes)-1].VolumeSource.Ephemeral == nil ||
-		!reflect.DeepEqual(ephemeral.VolumeClaimTemplate.Spec.StorageClassName, ssetVolumes[len(ssetVolumes)-1].VolumeSource.Ephemeral.VolumeClaimTemplate.Spec.StorageClassName) {
-		t.Fatal("Error adding Ephemeral Spec to StatefulSetSpec")
-	}
+	require.NotNil(t, ssetVolumes[len(ssetVolumes)-1].VolumeSource.Ephemeral, "Error adding Ephemeral Spec to StatefulSetSpec")
+	require.Equal(t, ephemeral.VolumeClaimTemplate.Spec.StorageClassName, ssetVolumes[len(ssetVolumes)-1].VolumeSource.Ephemeral.VolumeClaimTemplate.Spec.StorageClassName, "Error adding Ephemeral Spec to StatefulSetSpec")
 }
 
 func TestStatefulSetVolumeInitial(t *testing.T) {
@@ -318,42 +293,35 @@ func TestStatefulSetVolumeInitial(t *testing.T) {
 
 	expected := &appsv1.StatefulSet{
 		Spec: appsv1.StatefulSetSpec{
-			Template: v1.PodTemplateSpec{
-				Spec: v1.PodSpec{
-					Containers: []v1.Container{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
 						{
-							VolumeMounts: []v1.VolumeMount{
+							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "config-out",
 									ReadOnly:  true,
 									MountPath: "/etc/prometheus/config_out",
-									SubPath:   "",
 								},
 								{
-									Name:             "tls-assets",
-									ReadOnly:         true,
-									MountPath:        "/etc/prometheus/certs",
-									SubPath:          "",
-									MountPropagation: nil,
-									SubPathExpr:      "",
+									Name:      "tls-assets",
+									ReadOnly:  true,
+									MountPath: "/etc/prometheus/certs",
 								},
 								{
 									Name:      "prometheus-volume-init-test-db",
 									ReadOnly:  false,
 									MountPath: "/prometheus",
-									SubPath:   "",
 								},
 								{
 									Name:      "secret-test-secret1",
 									ReadOnly:  true,
 									MountPath: "/etc/prometheus/secrets/test-secret1",
-									SubPath:   "",
 								},
 								{
 									Name:      "rules-configmap-one",
-									ReadOnly:  false,
+									ReadOnly:  true,
 									MountPath: "/etc/prometheus/rules/rules-configmap-one",
-									SubPath:   "",
 								},
 								{
 									Name:      "web-config",
@@ -364,23 +332,23 @@ func TestStatefulSetVolumeInitial(t *testing.T) {
 							},
 						},
 					},
-					Volumes: []v1.Volume{
+					Volumes: []corev1.Volume{
 						{
 							Name: "config",
-							VolumeSource: v1.VolumeSource{
-								Secret: &v1.SecretVolumeSource{
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
 									SecretName: prompkg.ConfigSecretName(&p),
 								},
 							},
 						},
 						{
 							Name: "tls-assets",
-							VolumeSource: v1.VolumeSource{
-								Projected: &v1.ProjectedVolumeSource{
-									Sources: []v1.VolumeProjection{
+							VolumeSource: corev1.VolumeSource{
+								Projected: &corev1.ProjectedVolumeSource{
+									Sources: []corev1.VolumeProjection{
 										{
-											Secret: &v1.SecretProjection{
-												LocalObjectReference: v1.LocalObjectReference{
+											Secret: &corev1.SecretProjection{
+												LocalObjectReference: corev1.LocalObjectReference{
 													Name: prompkg.TLSAssetsSecretName(&p) + "-0",
 												},
 											},
@@ -391,42 +359,43 @@ func TestStatefulSetVolumeInitial(t *testing.T) {
 						},
 						{
 							Name: "config-out",
-							VolumeSource: v1.VolumeSource{
-								EmptyDir: &v1.EmptyDirVolumeSource{
-									Medium: v1.StorageMediumMemory,
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{
+									Medium: corev1.StorageMediumMemory,
 								},
 							},
 						},
 						{
 							Name: "secret-test-secret1",
-							VolumeSource: v1.VolumeSource{
-								Secret: &v1.SecretVolumeSource{
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
 									SecretName: "test-secret1",
 								},
 							},
 						},
 						{
 							Name: "rules-configmap-one",
-							VolumeSource: v1.VolumeSource{
-								ConfigMap: &v1.ConfigMapVolumeSource{
-									LocalObjectReference: v1.LocalObjectReference{
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
 										Name: "rules-configmap-one",
 									},
+									Optional: new(true),
 								},
 							},
 						},
 						{
 							Name: "web-config",
-							VolumeSource: v1.VolumeSource{
-								Secret: &v1.SecretVolumeSource{
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
 									SecretName: "prometheus-volume-init-test-web-config",
 								},
 							},
 						},
 						{
 							Name: "prometheus-volume-init-test-db",
-							VolumeSource: v1.VolumeSource{
-								EmptyDir: &v1.EmptyDirVolumeSource{},
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},
 						},
 					},
@@ -435,42 +404,37 @@ func TestStatefulSetVolumeInitial(t *testing.T) {
 		},
 	}
 
-	logger := newLogger()
+	logger := prompkg.NewLogger()
 
-	cg, err := prompkg.NewConfigGenerator(logger, &p, false)
+	cg, err := prompkg.NewConfigGenerator(logger, &p)
+	require.NoError(t, err)
+
+	shardedSecret, err := operator.ReconcileShardedSecret(
+		context.Background(),
+		map[string][]byte{},
+		fake.NewClientset(),
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      prompkg.TLSAssetsSecretName(&p),
+				Namespace: "test",
+			},
+		},
+	)
 	require.NoError(t, err)
 
 	sset, err := makeStatefulSet(
-		logger,
 		"volume-init-test",
 		&p,
-		p.Spec.BaseImage, p.Spec.Tag, p.Spec.SHA,
-		p.Spec.Retention,
-		p.Spec.RetentionSize,
-		p.Spec.Rules,
-		p.Spec.Query,
-		p.Spec.AllowOverlappingBlocks,
-		p.Spec.EnableAdminAPI,
-		p.Spec.QueryLogFile,
-		p.Spec.Thanos,
-		p.Spec.DisableCompaction,
 		defaultTestConfig,
 		cg,
 		[]string{"rules-configmap-one"},
 		"",
 		0,
-		[]string{prompkg.TLSAssetsSecretName(&p) + "-0"})
+		shardedSecret)
 	require.NoError(t, err)
 
-	if !reflect.DeepEqual(expected.Spec.Template.Spec.Volumes, sset.Spec.Template.Spec.Volumes) {
-		fmt.Println(pretty.Compare(expected.Spec.Template.Spec.Volumes, sset.Spec.Template.Spec.Volumes))
-		t.Fatal("expected volumes to match")
-	}
-
-	if !reflect.DeepEqual(expected.Spec.Template.Spec.Containers[0].VolumeMounts, sset.Spec.Template.Spec.Containers[0].VolumeMounts) {
-		fmt.Println(pretty.Compare(expected.Spec.Template.Spec.Containers[0].VolumeMounts, sset.Spec.Template.Spec.Containers[0].VolumeMounts))
-		t.Fatal("expected volume mounts to match")
-	}
+	require.Equalf(t, expected.Spec.Template.Spec.Volumes, sset.Spec.Template.Spec.Volumes, "expected volumes to match \n%s", pretty.Compare(expected.Spec.Template.Spec.Volumes, sset.Spec.Template.Spec.Volumes))
+	require.Equalf(t, expected.Spec.Template.Spec.Containers[0].VolumeMounts, sset.Spec.Template.Spec.Containers[0].VolumeMounts, "expected volume mounts to match \n%s", pretty.Compare(expected.Spec.Template.Spec.Containers[0].VolumeMounts, sset.Spec.Template.Spec.Containers[0].VolumeMounts))
 }
 
 func TestAdditionalConfigMap(t *testing.T) {
@@ -489,9 +453,7 @@ func TestAdditionalConfigMap(t *testing.T) {
 			cmVolumeFound = true
 		}
 	}
-	if !cmVolumeFound {
-		t.Fatal("ConfigMap volume not found")
-	}
+	require.True(t, cmVolumeFound, "ConfigMap volume not found")
 
 	cmMounted := false
 	for _, v := range sset.Spec.Template.Spec.Containers[0].VolumeMounts {
@@ -499,9 +461,7 @@ func TestAdditionalConfigMap(t *testing.T) {
 			cmMounted = true
 		}
 	}
-	if !cmMounted {
-		t.Fatal("ConfigMap volume not mounted")
-	}
+	require.True(t, cmMounted, "ConfigMap volume not mounted")
 }
 
 func TestListenLocal(t *testing.T) {
@@ -521,13 +481,11 @@ func TestListenLocal(t *testing.T) {
 		}
 	}
 
-	if !found {
-		t.Fatal("Prometheus not listening on loopback when it should.")
-	}
+	require.True(t, found, "Prometheus not listening on loopback when it should.")
 
-	expectedProbeHandler := func(probePath string) v1.ProbeHandler {
-		return v1.ProbeHandler{
-			Exec: &v1.ExecAction{
+	expectedProbeHandler := func(probePath string) corev1.ProbeHandler {
+		return corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
 				Command: []string{
 					`sh`,
 					`-c`,
@@ -538,41 +496,33 @@ func TestListenLocal(t *testing.T) {
 	}
 
 	actualStartupProbe := sset.Spec.Template.Spec.Containers[0].StartupProbe
-	expectedStartupProbe := &v1.Probe{
+	expectedStartupProbe := &corev1.Probe{
 		ProbeHandler:     expectedProbeHandler("/-/ready"),
 		TimeoutSeconds:   3,
 		PeriodSeconds:    15,
 		FailureThreshold: 60,
 	}
-	if !reflect.DeepEqual(actualStartupProbe, expectedStartupProbe) {
-		t.Fatalf("Startup probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedStartupProbe, actualStartupProbe)
-	}
+	require.Equal(t, expectedStartupProbe, actualStartupProbe, "Startup probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedStartupProbe, actualStartupProbe)
 
 	actualLivenessProbe := sset.Spec.Template.Spec.Containers[0].LivenessProbe
-	expectedLivenessProbe := &v1.Probe{
+	expectedLivenessProbe := &corev1.Probe{
 		ProbeHandler:     expectedProbeHandler("/-/healthy"),
 		TimeoutSeconds:   3,
 		PeriodSeconds:    5,
 		FailureThreshold: 6,
 	}
-	if !reflect.DeepEqual(actualLivenessProbe, expectedLivenessProbe) {
-		t.Fatalf("Liveness probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedLivenessProbe, actualLivenessProbe)
-	}
+	require.Equal(t, expectedLivenessProbe, actualLivenessProbe, "Liveness probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedLivenessProbe, actualLivenessProbe)
 
 	actualReadinessProbe := sset.Spec.Template.Spec.Containers[0].ReadinessProbe
-	expectedReadinessProbe := &v1.Probe{
+	expectedReadinessProbe := &corev1.Probe{
 		ProbeHandler:     expectedProbeHandler("/-/ready"),
 		TimeoutSeconds:   3,
 		PeriodSeconds:    5,
 		FailureThreshold: 3,
 	}
-	if !reflect.DeepEqual(actualReadinessProbe, expectedReadinessProbe) {
-		t.Fatalf("Readiness probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedReadinessProbe, actualReadinessProbe)
-	}
+	require.Equal(t, expectedReadinessProbe, actualReadinessProbe, "Readiness probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedReadinessProbe, actualReadinessProbe)
 
-	if len(sset.Spec.Template.Spec.Containers[0].Ports) != 0 {
-		t.Fatal("Prometheus container should have 0 ports defined")
-	}
+	require.Empty(t, sset.Spec.Template.Spec.Containers[0].Ports, "Prometheus container should have 0 ports defined")
 }
 
 func TestListenTLS(t *testing.T) {
@@ -582,14 +532,14 @@ func TestListenTLS(t *testing.T) {
 				Web: &monitoringv1.PrometheusWebSpec{
 					WebConfigFileFields: monitoringv1.WebConfigFileFields{
 						TLSConfig: &monitoringv1.WebTLSConfig{
-							KeySecret: v1.SecretKeySelector{
-								LocalObjectReference: v1.LocalObjectReference{
+							KeySecret: corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{
 									Name: "some-secret",
 								},
 							},
 							Cert: monitoringv1.SecretOrConfigMap{
-								ConfigMap: &v1.ConfigMapKeySelector{
-									LocalObjectReference: v1.LocalObjectReference{
+								ConfigMap: &corev1.ConfigMapKeySelector{
+									LocalObjectReference: corev1.LocalObjectReference{
 										Name: "some-configmap",
 									},
 								},
@@ -603,9 +553,9 @@ func TestListenTLS(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	expectedProbeHandler := func(probePath string) v1.ProbeHandler {
-		return v1.ProbeHandler{
-			HTTPGet: &v1.HTTPGetAction{
+	expectedProbeHandler := func(probePath string) corev1.ProbeHandler {
+		return corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
 				Path:   probePath,
 				Port:   intstr.FromString("web"),
 				Scheme: "HTTPS",
@@ -614,37 +564,31 @@ func TestListenTLS(t *testing.T) {
 	}
 
 	actualStartupProbe := sset.Spec.Template.Spec.Containers[0].StartupProbe
-	expectedStartupProbe := &v1.Probe{
+	expectedStartupProbe := &corev1.Probe{
 		ProbeHandler:     expectedProbeHandler("/-/ready"),
 		TimeoutSeconds:   3,
 		PeriodSeconds:    15,
 		FailureThreshold: 60,
 	}
-	if !reflect.DeepEqual(actualStartupProbe, expectedStartupProbe) {
-		t.Fatalf("Startup probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedStartupProbe, actualStartupProbe)
-	}
+	require.Equal(t, expectedStartupProbe, actualStartupProbe, "Startup probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedStartupProbe, actualStartupProbe)
 
 	actualLivenessProbe := sset.Spec.Template.Spec.Containers[0].LivenessProbe
-	expectedLivenessProbe := &v1.Probe{
+	expectedLivenessProbe := &corev1.Probe{
 		ProbeHandler:     expectedProbeHandler("/-/healthy"),
 		TimeoutSeconds:   3,
 		PeriodSeconds:    5,
 		FailureThreshold: 6,
 	}
-	if !reflect.DeepEqual(actualLivenessProbe, expectedLivenessProbe) {
-		t.Fatalf("Liveness probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedLivenessProbe, actualLivenessProbe)
-	}
+	require.Equal(t, expectedLivenessProbe, actualLivenessProbe, "Liveness probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedLivenessProbe, actualLivenessProbe)
 
 	actualReadinessProbe := sset.Spec.Template.Spec.Containers[0].ReadinessProbe
-	expectedReadinessProbe := &v1.Probe{
+	expectedReadinessProbe := &corev1.Probe{
 		ProbeHandler:     expectedProbeHandler("/-/ready"),
 		TimeoutSeconds:   3,
 		PeriodSeconds:    5,
 		FailureThreshold: 3,
 	}
-	if !reflect.DeepEqual(actualReadinessProbe, expectedReadinessProbe) {
-		t.Fatalf("Readiness probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedReadinessProbe, actualReadinessProbe)
-	}
+	require.Equal(t, expectedReadinessProbe, actualReadinessProbe, "Readiness probe doesn't match expected. \n\nExpected: %+v\n\nGot: %+v", expectedReadinessProbe, actualReadinessProbe)
 
 	expectedConfigReloaderReloadURL := "--reload-url=https://localhost:9090/-/reload"
 	reloadURLFound := false
@@ -653,9 +597,7 @@ func TestListenTLS(t *testing.T) {
 			reloadURLFound = true
 		}
 	}
-	if !reloadURLFound {
-		t.Fatalf("expected to find arg %s in config reloader", expectedConfigReloaderReloadURL)
-	}
+	require.True(t, reloadURLFound, "expected to find arg %s in config reloader", expectedConfigReloaderReloadURL)
 
 	expectedThanosSidecarPrometheusURL := "--prometheus.url=https://localhost:9090/"
 	prometheusURLFound := false
@@ -664,11 +606,24 @@ func TestListenTLS(t *testing.T) {
 			prometheusURLFound = true
 		}
 	}
-	if !prometheusURLFound {
-		t.Fatalf("expected to find arg %s in thanos sidecar", expectedThanosSidecarPrometheusURL)
-	}
+	require.True(t, prometheusURLFound, "expected to find arg %s in thanos sidecar", expectedThanosSidecarPrometheusURL)
 
 	fmt.Println(sset.Spec.Template.Spec.Containers[2].Args)
+
+	expectedArgsConfigReloader := []string{
+		"--listen-address=:8080",
+		"--web-config-file=/etc/prometheus/web_config/web-config.yaml",
+		"--reload-url=https://localhost:9090/-/reload",
+		"--config-file=/etc/prometheus/config/prometheus.yaml.gz",
+		"--config-envsubst-file=/etc/prometheus/config_out/prometheus.env.yaml",
+		"--watched-dir=/etc/prometheus/config",
+	}
+
+	for _, c := range sset.Spec.Template.Spec.Containers {
+		if c.Name == "config-reloader" {
+			require.Equal(t, expectedArgsConfigReloader, c.Args, "expected container args are %s, but found %s", expectedArgsConfigReloader, c.Args)
+		}
+	}
 }
 
 func TestTagAndShaAndVersion(t *testing.T) {
@@ -685,9 +640,7 @@ func TestTagAndShaAndVersion(t *testing.T) {
 
 		image := sset.Spec.Template.Spec.Containers[0].Image
 		expected := "quay.io/prometheus/prometheus:my-unrelated-tag"
-		if image != expected {
-			t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
-		}
+		require.Equal(t, expected, image, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
 	}
 	{
 		sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
@@ -703,9 +656,7 @@ func TestTagAndShaAndVersion(t *testing.T) {
 
 		image := sset.Spec.Template.Spec.Containers[0].Image
 		expected := "quay.io/prometheus/prometheus@sha256:7384a79f4b4991bf8269e7452390249b7c70bcdd10509c8c1c6c6e30e32fb324"
-		if image != expected {
-			t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
-		}
+		require.Equal(t, expected, image, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
 	}
 	// For tests which set monitoringv1.PrometheusSpec.Image, the result will be Image only. SHA, Tag, Version are not considered.
 	{
@@ -724,9 +675,7 @@ func TestTagAndShaAndVersion(t *testing.T) {
 
 		resultImage := sset.Spec.Template.Spec.Containers[0].Image
 		expected := image
-		if resultImage != expected {
-			t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
-		}
+		require.Equal(t, expected, resultImage, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
 	}
 	{
 		image := "my-reg/prometheus:latest"
@@ -744,9 +693,7 @@ func TestTagAndShaAndVersion(t *testing.T) {
 
 		resultImage := sset.Spec.Template.Spec.Containers[0].Image
 		expected := image
-		if resultImage != expected {
-			t.Fatalf("Explicit image should have precedence. Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
-		}
+		require.Equal(t, expected, resultImage, "Explicit image should have precedence. Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
 	}
 	{
 		image := "my-reg/prometheus"
@@ -762,9 +709,7 @@ func TestTagAndShaAndVersion(t *testing.T) {
 
 		resultImage := sset.Spec.Template.Spec.Containers[0].Image
 		expected := image
-		if resultImage != expected {
-			t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
-		}
+		require.Equal(t, expected, resultImage, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
 	}
 	{
 		image := "my-reg/prometheus"
@@ -781,9 +726,7 @@ func TestTagAndShaAndVersion(t *testing.T) {
 
 		resultImage := sset.Spec.Template.Spec.Containers[0].Image
 		expected := image
-		if resultImage != expected {
-			t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
-		}
+		require.Equal(t, expected, resultImage, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
 	}
 	{
 		image := "my-reg/prometheus"
@@ -798,9 +741,7 @@ func TestTagAndShaAndVersion(t *testing.T) {
 
 		resultImage := sset.Spec.Template.Spec.Containers[0].Image
 		expected := image
-		if resultImage != expected {
-			t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
-		}
+		require.Equal(t, expected, resultImage, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
 	}
 	{
 		image := "my-reg/prometheus"
@@ -816,9 +757,7 @@ func TestTagAndShaAndVersion(t *testing.T) {
 
 		resultImage := sset.Spec.Template.Spec.Containers[0].Image
 		expected := image
-		if resultImage != expected {
-			t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
-		}
+		require.Equal(t, expected, resultImage, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
 	}
 	{
 		image := ""
@@ -834,9 +773,7 @@ func TestTagAndShaAndVersion(t *testing.T) {
 
 		resultImage := sset.Spec.Template.Spec.Containers[0].Image
 		expected := "quay.io/prometheus/prometheus:my-unrelated-tag"
-		if resultImage != expected {
-			t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
-		}
+		require.Equal(t, expected, resultImage, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
 	}
 	{
 		image := "my-reg/prometheus@sha256:7384a79f4b4991bf8269e7452390249b7c70bcdd10509c8c1c6c6e30e32fb325"
@@ -853,14 +790,12 @@ func TestTagAndShaAndVersion(t *testing.T) {
 
 		resultImage := sset.Spec.Template.Spec.Containers[0].Image
 		expected := "my-reg/prometheus@sha256:7384a79f4b4991bf8269e7452390249b7c70bcdd10509c8c1c6c6e30e32fb325"
-		if resultImage != expected {
-			t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
-		}
+		require.Equal(t, expected, resultImage, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, resultImage)
 	}
 }
 
 func TestPrometheusDefaultBaseImageFlag(t *testing.T) {
-	operatorConfig := &operator.Config{
+	operatorConfig := prompkg.Config{
 		ReloaderConfig:             defaultTestConfig.ReloaderConfig,
 		PrometheusDefaultBaseImage: "nondefaultuseflag/quay.io/prometheus/prometheus",
 		ThanosDefaultBaseImage:     "nondefaultuseflag/quay.io/thanos/thanos",
@@ -872,7 +807,7 @@ func TestPrometheusDefaultBaseImageFlag(t *testing.T) {
 		"testannotation": "testannotationvalue",
 	}
 
-	logger := newLogger()
+	logger := prompkg.NewLogger()
 	p := monitoringv1.Prometheus{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels:      labels,
@@ -880,40 +815,27 @@ func TestPrometheusDefaultBaseImageFlag(t *testing.T) {
 		},
 	}
 
-	cg, err := prompkg.NewConfigGenerator(logger, &p, false)
+	cg, err := prompkg.NewConfigGenerator(logger, &p)
 	require.NoError(t, err)
 
 	sset, err := makeStatefulSet(
-		logger,
 		"test",
 		&p,
-		p.Spec.BaseImage, p.Spec.Tag, p.Spec.SHA,
-		p.Spec.Retention,
-		p.Spec.RetentionSize,
-		p.Spec.Rules,
-		p.Spec.Query,
-		p.Spec.AllowOverlappingBlocks,
-		p.Spec.EnableAdminAPI,
-		p.Spec.QueryLogFile,
-		p.Spec.Thanos,
-		p.Spec.DisableCompaction,
 		operatorConfig,
 		cg,
 		nil,
 		"",
 		0,
-		nil)
+		&operator.ShardedSecret{})
 	require.NoError(t, err)
 
 	image := sset.Spec.Template.Spec.Containers[0].Image
 	expected := "nondefaultuseflag/quay.io/prometheus/prometheus" + ":" + operator.DefaultPrometheusVersion
-	if image != expected {
-		t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
-	}
+	require.Equal(t, expected, image, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
 }
 
 func TestThanosDefaultBaseImageFlag(t *testing.T) {
-	thanosBaseImageConfig := &operator.Config{
+	thanosBaseImageConfig := prompkg.Config{
 		ReloaderConfig:             defaultTestConfig.ReloaderConfig,
 		PrometheusDefaultBaseImage: "nondefaultuseflag/quay.io/prometheus/prometheus",
 		ThanosDefaultBaseImage:     "nondefaultuseflag/quay.io/thanos/thanos",
@@ -924,7 +846,7 @@ func TestThanosDefaultBaseImageFlag(t *testing.T) {
 	annotations := map[string]string{
 		"testannotation": "testannotationvalue",
 	}
-	logger := newLogger()
+	logger := prompkg.NewLogger()
 	p := monitoringv1.Prometheus{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels:      labels,
@@ -935,36 +857,23 @@ func TestThanosDefaultBaseImageFlag(t *testing.T) {
 		},
 	}
 
-	cg, err := prompkg.NewConfigGenerator(logger, &p, false)
+	cg, err := prompkg.NewConfigGenerator(logger, &p)
 	require.NoError(t, err)
 
 	sset, err := makeStatefulSet(
-		logger,
 		"test",
 		&p,
-		p.Spec.BaseImage, p.Spec.Tag, p.Spec.SHA,
-		p.Spec.Retention,
-		p.Spec.RetentionSize,
-		p.Spec.Rules,
-		p.Spec.Query,
-		p.Spec.AllowOverlappingBlocks,
-		p.Spec.EnableAdminAPI,
-		p.Spec.QueryLogFile,
-		p.Spec.Thanos,
-		p.Spec.DisableCompaction,
 		thanosBaseImageConfig,
 		cg,
 		nil,
 		"",
 		0,
-		nil)
+		&operator.ShardedSecret{})
 	require.NoError(t, err)
 
 	image := sset.Spec.Template.Spec.Containers[2].Image
 	expected := "nondefaultuseflag/quay.io/thanos/thanos" + ":" + operator.DefaultThanosVersion
-	if image != expected {
-		t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
-	}
+	require.Equal(t, expected, image, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
 }
 
 func TestThanosTagAndShaAndVersion(t *testing.T) {
@@ -983,9 +892,7 @@ func TestThanosTagAndShaAndVersion(t *testing.T) {
 
 		image := sset.Spec.Template.Spec.Containers[2].Image
 		expected := "quay.io/thanos/thanos:my-unrelated-tag"
-		if image != expected {
-			t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
-		}
+		require.Equal(t, expected, image, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
 	}
 	{
 		thanosSHA := "7384a79f4b4991bf8269e7452390249b7c70bcdd10509c8c1c6c6e30e32fb324"
@@ -1004,9 +911,7 @@ func TestThanosTagAndShaAndVersion(t *testing.T) {
 
 		image := sset.Spec.Template.Spec.Containers[2].Image
 		expected := "quay.io/thanos/thanos@sha256:7384a79f4b4991bf8269e7452390249b7c70bcdd10509c8c1c6c6e30e32fb324"
-		if image != expected {
-			t.Fatalf("Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
-		}
+		require.Equal(t, expected, image, "Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
 	}
 	{
 		thanosSHA := "7384a79f4b4991bf8269e7452390249b7c70bcdd10509c8c1c6c6e30e32fb324"
@@ -1027,9 +932,7 @@ func TestThanosTagAndShaAndVersion(t *testing.T) {
 
 		image := sset.Spec.Template.Spec.Containers[2].Image
 		expected := "my-registry/thanos:latest"
-		if image != expected {
-			t.Fatalf("Explicit Thanos image should have precedence. Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
-		}
+		require.Equal(t, expected, image, "Explicit Thanos image should have precedence. Unexpected container image.\n\nExpected: %s\n\nGot: %s", expected, image)
 	}
 }
 
@@ -1042,20 +945,18 @@ func TestThanosResourcesNotSet(t *testing.T) {
 	require.NoError(t, err)
 
 	res := sset.Spec.Template.Spec.Containers[2].Resources
-	if res.Limits != nil || res.Requests != nil {
-		t.Fatalf("Unexpected resources defined. \n\nExpected: nil\n\nGot: %v, %v", res.Limits, res.Requests)
-	}
+	require.False(t, (res.Limits != nil || res.Requests != nil), "Unexpected resources defined. \n\nExpected: nil\n\nGot: %v, %v", res.Limits, res.Requests)
 }
 
 func TestThanosResourcesSet(t *testing.T) {
-	expected := v1.ResourceRequirements{
-		Limits: v1.ResourceList{
-			v1.ResourceCPU:    resource.MustParse("125m"),
-			v1.ResourceMemory: resource.MustParse("75Mi"),
+	expected := corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("125m"),
+			corev1.ResourceMemory: resource.MustParse("75Mi"),
 		},
-		Requests: v1.ResourceList{
-			v1.ResourceCPU:    resource.MustParse("100m"),
-			v1.ResourceMemory: resource.MustParse("50Mi"),
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("50Mi"),
 		},
 	}
 	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
@@ -1068,9 +969,7 @@ func TestThanosResourcesSet(t *testing.T) {
 	require.NoError(t, err)
 
 	actual := sset.Spec.Template.Spec.Containers[2].Resources
-	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("Unexpected resources defined. \n\nExpected: %v\n\nGot: %v", expected, actual)
-	}
+	require.Equal(t, expected, actual, "Unexpected resources defined. \n\nExpected: %v\n\nGot: %v", expected, actual)
 }
 
 func TestThanosNoObjectStorage(t *testing.T) {
@@ -1081,24 +980,15 @@ func TestThanosNoObjectStorage(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	if sset.Spec.Template.Spec.Containers[0].Name != "prometheus" {
-		t.Fatalf("expected 1st containers to be prometheus, got %s", sset.Spec.Template.Spec.Containers[0].Name)
-	}
-
-	if sset.Spec.Template.Spec.Containers[2].Name != "thanos-sidecar" {
-		t.Fatalf("expected 3rd container to be thanos-sidecar, got %s", sset.Spec.Template.Spec.Containers[2].Name)
-	}
+	require.Equal(t, "prometheus", sset.Spec.Template.Spec.Containers[0].Name, "expected 1st containers to be prometheus, got %s", sset.Spec.Template.Spec.Containers[0].Name)
+	require.Equal(t, "thanos-sidecar", sset.Spec.Template.Spec.Containers[2].Name, "expected 3rd container to be thanos-sidecar, got %s", sset.Spec.Template.Spec.Containers[2].Name)
 
 	for _, arg := range sset.Spec.Template.Spec.Containers[0].Args {
-		if strings.HasPrefix(arg, "--storage.tsdb.max-block-duration=2h") {
-			t.Fatal("Prometheus compaction should be disabled")
-		}
+		require.False(t, strings.HasPrefix(arg, "--storage.tsdb.max-block-duration=2h"), "Prometheus compaction should be disabled")
 	}
 
 	for _, arg := range sset.Spec.Template.Spec.Containers[2].Args {
-		if strings.HasPrefix(arg, "--tsdb.path=") {
-			t.Fatal("--tsdb.path argument should not be given to the Thanos sidecar")
-		}
+		require.False(t, strings.HasPrefix(arg, "--tsdb.path="), "--tsdb.path argument should not be given to the Thanos sidecar")
 	}
 }
 
@@ -1107,8 +997,14 @@ func TestThanosObjectStorage(t *testing.T) {
 
 	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		Spec: monitoringv1.PrometheusSpec{
+			// Pin a Prometheus version older than v3.9.0 so that compaction is
+			// disabled (min == max block duration) rather than delegated to the
+			// delayed-compaction coordination path.
+			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				Version: "2.55.0",
+			},
 			Thanos: &monitoringv1.ThanosSpec{
-				ObjectStorageConfig: &v1.SecretKeySelector{
+				ObjectStorageConfig: &corev1.SecretKeySelector{
 					Key: testKey,
 				},
 				BlockDuration: "2h",
@@ -1117,13 +1013,8 @@ func TestThanosObjectStorage(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	if sset.Spec.Template.Spec.Containers[0].Name != "prometheus" {
-		t.Fatalf("expected 1st containers to be prometheus, got %s", sset.Spec.Template.Spec.Containers[0].Name)
-	}
-
-	if sset.Spec.Template.Spec.Containers[2].Name != "thanos-sidecar" {
-		t.Fatalf("expected 3rd containers to be thanos-sidecar, got %s", sset.Spec.Template.Spec.Containers[2].Name)
-	}
+	require.Equal(t, "prometheus", sset.Spec.Template.Spec.Containers[0].Name, "expected 1st containers to be prometheus, got %s", sset.Spec.Template.Spec.Containers[0].Name)
+	require.Equal(t, "thanos-sidecar", sset.Spec.Template.Spec.Containers[2].Name, "expected 3rd containers to be thanos-sidecar, got %s", sset.Spec.Template.Spec.Containers[2].Name)
 
 	var containsEnvVar bool
 	for _, env := range sset.Spec.Template.Spec.Containers[2].Env {
@@ -1134,35 +1025,15 @@ func TestThanosObjectStorage(t *testing.T) {
 			}
 		}
 	}
-	if !containsEnvVar {
-		t.Fatalf("Thanos sidecar is missing expected OBJSTORE_CONFIG env var with correct value")
-	}
+	require.True(t, containsEnvVar, "Thanos sidecar is missing expected OBJSTORE_CONFIG env var with correct value")
 
 	{
-		var containsArg bool
 		const expectedArg = "--objstore.config=$(OBJSTORE_CONFIG)"
-		for _, arg := range sset.Spec.Template.Spec.Containers[2].Args {
-			if arg == expectedArg {
-				containsArg = true
-				break
-			}
-		}
-		if !containsArg {
-			t.Fatalf("Thanos sidecar is missing expected argument: %s", expectedArg)
-		}
+		require.True(t, slices.Contains(sset.Spec.Template.Spec.Containers[2].Args, expectedArg), "Thanos sidecar is missing expected argument: %s", expectedArg)
 	}
 	{
-		var containsArg bool
 		const expectedArg = "--storage.tsdb.max-block-duration=2h"
-		for _, arg := range sset.Spec.Template.Spec.Containers[0].Args {
-			if arg == expectedArg {
-				containsArg = true
-				break
-			}
-		}
-		if !containsArg {
-			t.Fatalf("Prometheus is missing expected argument: %s", expectedArg)
-		}
+		require.True(t, slices.Contains(sset.Spec.Template.Spec.Containers[0].Args, expectedArg), "Prometheus is missing expected argument: %s", expectedArg)
 	}
 
 	{
@@ -1173,9 +1044,7 @@ func TestThanosObjectStorage(t *testing.T) {
 				break
 			}
 		}
-		if !found {
-			t.Fatalf("--tsdb.path argument should be given to the Thanos sidecar, got %q", strings.Join(sset.Spec.Template.Spec.Containers[3].Args, " "))
-		}
+		require.True(t, found, "--tsdb.path argument should be given to the Thanos sidecar, got %q", strings.Join(sset.Spec.Template.Spec.Containers[2].Args, " "))
 	}
 
 	{
@@ -1186,9 +1055,7 @@ func TestThanosObjectStorage(t *testing.T) {
 				break
 			}
 		}
-		if !found {
-			t.Fatal("Prometheus data volume should be mounted in the Thanos sidecar")
-		}
+		require.True(t, found, "Prometheus data volume should be mounted in the Thanos sidecar")
 	}
 }
 
@@ -1196,6 +1063,12 @@ func TestThanosObjectStorageFile(t *testing.T) {
 	testPath := "/vault/secret/config.yaml"
 	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		Spec: monitoringv1.PrometheusSpec{
+			// Pin a Prometheus version older than v3.9.0 so that compaction is
+			// disabled (min == max block duration) rather than delegated to the
+			// delayed-compaction coordination path.
+			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				Version: "2.55.0",
+			},
 			Thanos: &monitoringv1.ThanosSpec{
 				ObjectStorageConfigFile: &testPath,
 				BlockDuration:           "2h",
@@ -1205,39 +1078,24 @@ func TestThanosObjectStorageFile(t *testing.T) {
 	require.NoError(t, err)
 
 	{
-		var containsArg bool
 		expectedArg := "--objstore.config-file=" + testPath
 		for _, container := range sset.Spec.Template.Spec.Containers {
 			if container.Name == "thanos-sidecar" {
-				for _, arg := range container.Args {
-					if arg == expectedArg {
-						containsArg = true
-						break
-					}
-				}
+				require.True(t, slices.Contains(container.Args, expectedArg),
+					"Thanos sidecar is missing expected argument: %s", expectedArg)
+				break
 			}
-		}
-		if !containsArg {
-			t.Fatalf("Thanos sidecar is missing expected argument: %s", expectedArg)
 		}
 	}
 
 	{
-		var containsArg bool
 		const expectedArg = "--storage.tsdb.max-block-duration=2h"
 		for _, container := range sset.Spec.Template.Spec.Containers {
 			if container.Name == "prometheus" {
-				for _, arg := range container.Args {
-					if arg == expectedArg {
-						containsArg = true
-						break
-					}
-				}
+				require.True(t, slices.Contains(container.Args, expectedArg),
+					"Prometheus is missing expected argument: %s", expectedArg)
+				break
 			}
-
-		}
-		if !containsArg {
-			t.Fatalf("Prometheus is missing expected argument: %s", expectedArg)
 		}
 	}
 
@@ -1253,9 +1111,7 @@ func TestThanosObjectStorageFile(t *testing.T) {
 				}
 			}
 		}
-		if !found {
-			t.Fatalf("--tsdb.path argument should be given to the Thanos sidecar, got %q", strings.Join(sset.Spec.Template.Spec.Containers[3].Args, " "))
-		}
+		require.True(t, found, "--tsdb.path argument should be given to the Thanos sidecar, got %q", strings.Join(sset.Spec.Template.Spec.Containers[2].Args, " "))
 	}
 
 	{
@@ -1270,9 +1126,7 @@ func TestThanosObjectStorageFile(t *testing.T) {
 				}
 			}
 		}
-		if !found {
-			t.Fatal("Prometheus data volume should be mounted in the Thanos sidecar")
-		}
+		require.True(t, found, "Prometheus data volume should be mounted in the Thanos sidecar")
 	}
 }
 
@@ -1281,9 +1135,15 @@ func TestThanosBlockDuration(t *testing.T) {
 
 	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		Spec: monitoringv1.PrometheusSpec{
+			// Pin a Prometheus version older than v3.9.0 so that compaction is
+			// disabled and the BlockDuration is applied to the min/max block
+			// duration flags.
+			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				Version: "2.55.0",
+			},
 			Thanos: &monitoringv1.ThanosSpec{
 				BlockDuration: "1h",
-				ObjectStorageConfig: &v1.SecretKeySelector{
+				ObjectStorageConfig: &corev1.SecretKeySelector{
 					Key: testKey,
 				},
 			},
@@ -1297,9 +1157,141 @@ func TestThanosBlockDuration(t *testing.T) {
 			found = true
 		}
 	}
-	if !found {
-		t.Fatal("Thanos BlockDuration arg change not found")
+	require.True(t, found, "Thanos BlockDuration arg change not found")
+}
+
+// containerByName returns the container with the given name from the pod spec.
+func containerByName(t *testing.T, sset *appsv1.StatefulSet, name string) corev1.Container {
+	t.Helper()
+	for _, c := range sset.Spec.Template.Spec.Containers {
+		if c.Name == name {
+			return c
+		}
 	}
+	require.Failf(t, "container not found", "no container named %q in the pod spec", name)
+	return corev1.Container{}
+}
+
+// TestThanosDelayedCompaction verifies that with Prometheus >= v3.9.0 and Thanos
+// >= v0.42.0, the operator keeps local compaction enabled and coordinates block
+// uploads with the sidecar through the shipper meta file instead of disabling
+// compaction. Otherwise (versions too old, or compaction explicitly disabled) it
+// falls back to disabling compaction. Thanos v0.41.0 is excluded: its sidecar
+// rejects the resulting flags due to a validation bug (issue #8763).
+// ref: https://github.com/prometheus-operator/prometheus-operator/issues/8266
+func TestThanosDelayedCompaction(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		promVersion       string
+		thanosVersion     string
+		disableCompaction bool
+		delayed           bool
+	}{
+		{name: "supported versions", promVersion: "3.9.0", thanosVersion: "0.42.0", delayed: true},
+		{name: "prometheus too old", promVersion: "3.8.0", thanosVersion: "0.42.0"},
+		{name: "thanos too old", promVersion: "3.9.0", thanosVersion: "0.40.0"},
+		{name: "thanos v0.41.0 unsupported due to strict sidecar validation", promVersion: "3.9.0", thanosVersion: "0.41.0"},
+		{name: "compaction explicitly disabled", promVersion: "3.9.0", thanosVersion: "0.42.0", disableCompaction: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			thanosVersion := tc.thanosVersion
+			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				Spec: monitoringv1.PrometheusSpec{
+					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+						Version: tc.promVersion,
+					},
+					DisableCompaction: tc.disableCompaction,
+					Thanos: &monitoringv1.ThanosSpec{
+						Version: &thanosVersion,
+						ObjectStorageConfig: &corev1.SecretKeySelector{
+							Key: "thanos-config-secret-test",
+						},
+					},
+				},
+			})
+			require.NoError(t, err)
+
+			promArgs := containerByName(t, sset, "prometheus").Args
+			sidecarArgs := containerByName(t, sset, "thanos-sidecar").Args
+			delayArg := "--storage.tsdb.delay-compact-file.path=" + filepath.Join(prompkg.StorageDir, "thanos.shipper.json")
+
+			if tc.delayed {
+				require.Contains(t, promArgs, delayArg)
+				for _, arg := range promArgs {
+					require.False(t, strings.HasPrefix(arg, "--storage.tsdb.max-block-duration="), "compaction should stay enabled: %q", arg)
+					require.False(t, strings.HasPrefix(arg, "--storage.tsdb.min-block-duration="), "compaction should stay enabled: %q", arg)
+				}
+				require.Contains(t, sidecarArgs, "--shipper.meta-file-name=thanos.shipper.json")
+				require.Contains(t, sidecarArgs, "--shipper.ignore-unequal-block-size")
+				return
+			}
+
+			require.Contains(t, promArgs, "--storage.tsdb.max-block-duration=2h")
+			require.NotContains(t, promArgs, delayArg)
+			require.NotContains(t, sidecarArgs, "--shipper.ignore-unequal-block-size")
+		})
+	}
+}
+
+// TestThanosInvalidVersion verifies that an unparsable Thanos version surfaces
+// an error instead of being silently swallowed.
+func TestThanosInvalidVersion(t *testing.T) {
+	invalidVersion := "not-a-version"
+	_, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+		Spec: monitoringv1.PrometheusSpec{
+			Thanos: &monitoringv1.ThanosSpec{
+				Version: &invalidVersion,
+				ObjectStorageConfig: &corev1.SecretKeySelector{
+					Key: "thanos-config-secret-test",
+				},
+			},
+		},
+	})
+	require.Error(t, err)
+}
+
+func TestThanosWithNamedPVC(t *testing.T) {
+	testKey := "named-pvc"
+	storageClass := "storageclass"
+
+	pvc := monitoringv1.EmbeddedPersistentVolumeClaim{
+		EmbeddedObjectMetadata: monitoringv1.EmbeddedObjectMetadata{
+			Name: testKey,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			StorageClassName: &storageClass,
+		},
+	}
+
+	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+		Spec: monitoringv1.PrometheusSpec{
+			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				Storage: &monitoringv1.StorageSpec{
+					VolumeClaimTemplate: pvc,
+				},
+			},
+			Thanos: &monitoringv1.ThanosSpec{
+				BlockDuration: "1h",
+				ObjectStorageConfig: &corev1.SecretKeySelector{
+					Key: testKey,
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	found := false
+	for _, container := range sset.Spec.Template.Spec.Containers {
+		if container.Name == "thanos-sidecar" {
+			for _, vol := range container.VolumeMounts {
+				if vol.Name == testKey {
+					found = true
+				}
+			}
+		}
+	}
+	require.True(t, found, "VolumeClaimTemplate name not found on thanos-sidecar volumeMounts")
 }
 
 func TestThanosTracing(t *testing.T) {
@@ -1308,7 +1300,7 @@ func TestThanosTracing(t *testing.T) {
 	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		Spec: monitoringv1.PrometheusSpec{
 			Thanos: &monitoringv1.ThanosSpec{
-				TracingConfig: &v1.SecretKeySelector{
+				TracingConfig: &corev1.SecretKeySelector{
 					Key: testKey,
 				},
 			},
@@ -1316,13 +1308,8 @@ func TestThanosTracing(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	if sset.Spec.Template.Spec.Containers[0].Name != "prometheus" {
-		t.Fatalf("expected 1st containers to be prometheus, got %s", sset.Spec.Template.Spec.Containers[0].Name)
-	}
-
-	if sset.Spec.Template.Spec.Containers[2].Name != "thanos-sidecar" {
-		t.Fatalf("expected 3rd containers to be thanos-sidecar, got %s", sset.Spec.Template.Spec.Containers[2].Name)
-	}
+	require.Equal(t, "prometheus", sset.Spec.Template.Spec.Containers[0].Name, "expected 1st containers to be prometheus, got %s", sset.Spec.Template.Spec.Containers[0].Name)
+	require.Equal(t, "thanos-sidecar", sset.Spec.Template.Spec.Containers[2].Name, "expected 3rd containers to be thanos-sidecar, got %s", sset.Spec.Template.Spec.Containers[2].Name)
 
 	var containsEnvVar bool
 	for _, env := range sset.Spec.Template.Spec.Containers[2].Env {
@@ -1333,22 +1320,11 @@ func TestThanosTracing(t *testing.T) {
 			}
 		}
 	}
-	if !containsEnvVar {
-		t.Fatalf("Thanos sidecar is missing expected TRACING_CONFIG env var with correct value")
-	}
+	require.True(t, containsEnvVar, "Thanos sidecar is missing expected TRACING_CONFIG env var with correct value")
 
 	{
-		var containsArg bool
 		const expectedArg = "--tracing.config=$(TRACING_CONFIG)"
-		for _, arg := range sset.Spec.Template.Spec.Containers[2].Args {
-			if arg == expectedArg {
-				containsArg = true
-				break
-			}
-		}
-		if !containsArg {
-			t.Fatalf("Thanos sidecar is missing expected argument: %s", expectedArg)
-		}
+		require.True(t, slices.Contains(sset.Spec.Template.Spec.Containers[2].Args, expectedArg), "Thanos sidecar is missing expected argument: %s", expectedArg)
 	}
 }
 
@@ -1358,17 +1334,17 @@ func TestThanosSideCarVolumes(t *testing.T) {
 	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		Spec: monitoringv1.PrometheusSpec{
 			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
-				Volumes: []v1.Volume{
+				Volumes: []corev1.Volume{
 					{
 						Name: testVolume,
-						VolumeSource: v1.VolumeSource{
-							EmptyDir: &v1.EmptyDirVolumeSource{},
+						VolumeSource: corev1.VolumeSource{
+							EmptyDir: &corev1.EmptyDirVolumeSource{},
 						},
 					},
 				},
 			},
 			Thanos: &monitoringv1.ThanosSpec{
-				VolumeMounts: []v1.VolumeMount{
+				VolumeMounts: []corev1.VolumeMount{
 					{
 						Name:      testVolume,
 						MountPath: testVolumeMountPath,
@@ -1386,9 +1362,7 @@ func TestThanosSideCarVolumes(t *testing.T) {
 			break
 		}
 	}
-	if !containsVolume {
-		t.Fatalf("Thanos sidecar volume is missing expected volume: %s", testVolume)
-	}
+	require.True(t, containsVolume, "Thanos sidecar volume is missing expected volume: %s", testVolume)
 
 	var containsVolumeMount bool
 	for _, container := range sset.Spec.Template.Spec.Containers {
@@ -1402,9 +1376,7 @@ func TestThanosSideCarVolumes(t *testing.T) {
 		}
 	}
 
-	if !containsVolumeMount {
-		t.Fatal("expected thanos sidecar volume mounts to match")
-	}
+	require.True(t, containsVolumeMount, "expected thanos sidecar volume mounts to match")
 }
 
 func TestRetentionAndRetentionSize(t *testing.T) {
@@ -1412,80 +1384,89 @@ func TestRetentionAndRetentionSize(t *testing.T) {
 		version                    string
 		specRetention              monitoringv1.Duration
 		specRetentionSize          monitoringv1.ByteSize
+		specRetentionPercentage    *resource.Quantity
 		expectedRetentionArg       string
 		expectedRetentionSizeArg   string
 		shouldContainRetention     bool
 		shouldContainRetentionSize bool
 	}{
-		{"v2.5.0", "", "", "--storage.tsdb.retention=24h", "--storage.tsdb.retention.size=", true, false},
-		{"v2.5.0", "1d", "", "--storage.tsdb.retention=1d", "--storage.tsdb.retention.size=", true, false},
-		{"v2.5.0", "", "512MB", "--storage.tsdb.retention=24h", "--storage.tsdb.retention.size=512MB", true, false},
-		{"v2.5.0", "1d", "512MB", "--storage.tsdb.retention=1d", "--storage.tsdb.retention.size=512MB", true, false},
-		{"v2.7.0", "", "", "--storage.tsdb.retention.time=24h", "--storage.tsdb.retention.size=", true, false},
-		{"v2.7.0", "1d", "", "--storage.tsdb.retention.time=1d", "--storage.tsdb.retention.size=", true, false},
-		{"v2.7.0", "", "512MB", "--storage.tsdb.retention.time=24h", "--storage.tsdb.retention.size=512MB", false, true},
-		{"v2.7.0", "1d", "512MB", "--storage.tsdb.retention.time=1d", "--storage.tsdb.retention.size=512MB", true, true},
+		{"v2.5.0", "", "", nil, "--storage.tsdb.retention=24h", "--storage.tsdb.retention.size=", true, false},
+		{"v2.5.0", "1d", "", nil, "--storage.tsdb.retention=1d", "--storage.tsdb.retention.size=", true, false},
+		{"v2.5.0", "", "512MB", nil, "--storage.tsdb.retention=24h", "--storage.tsdb.retention.size=512MB", true, false},
+		{"v2.5.0", "1d", "512MB", nil, "--storage.tsdb.retention=1d", "--storage.tsdb.retention.size=512MB", true, false},
+		{"v2.7.0", "", "", nil, "--storage.tsdb.retention.time=24h", "--storage.tsdb.retention.size=", true, false},
+		{"v2.7.0", "1d", "", nil, "--storage.tsdb.retention.time=1d", "--storage.tsdb.retention.size=", true, false},
+		{"v2.7.0", "", "512MB", nil, "--storage.tsdb.retention.time=24h", "--storage.tsdb.retention.size=512MB", false, true},
+		{"v2.7.0", "1d", "512MB", nil, "--storage.tsdb.retention.time=1d", "--storage.tsdb.retention.size=512MB", true, true},
+		{"v3.10.0", "1d", "512MB", nil, "--storage.tsdb.retention.time=1d", "--storage.tsdb.retention.size=512MB", true, true},
+		// Percentage-based retention isn't supported before v3.11.0 so it
+		// shouldn't prevent the default time-based retention from being set.
+		{"v3.10.0", "", "", resource.NewQuantity(80, resource.DecimalSI), "--storage.tsdb.retention.time=24h", "--storage.tsdb.retention.size=", true, false},
+		{"v3.11.0", "", "", nil, "--storage.tsdb.retention.time=24h", "--storage.tsdb.retention.size=", false, false},
+		{"v3.11.0", "1d", "", nil, "--storage.tsdb.retention.time=1d", "--storage.tsdb.retention.size=", false, false},
+		{"v3.11.0", "", "512MB", nil, "--storage.tsdb.retention.time=24h", "--storage.tsdb.retention.size=512MB", false, false},
+		{"v3.11.0", "1d", "512MB", nil, "--storage.tsdb.retention.time=1d", "--storage.tsdb.retention.size=512MB", false, false},
+		{"v3.11.0", "", "", resource.NewQuantity(80, resource.DecimalSI), "--storage.tsdb.retention.time=24h", "--storage.tsdb.retention.size=", false, false},
 	}
 
-	for i, test := range tests {
-		sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
-			Spec: monitoringv1.PrometheusSpec{
-				CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
-					Version: test.version,
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("%s retention=%q retentionSize=%q", test.version, test.specRetention, test.specRetentionSize), func(t *testing.T) {
+			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				Spec: monitoringv1.PrometheusSpec{
+					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+						Version: test.version,
+					},
+					Retention:           test.specRetention,
+					RetentionSize:       test.specRetentionSize,
+					RetentionPercentage: test.specRetentionPercentage,
 				},
-				Retention:     test.specRetention,
-				RetentionSize: test.specRetentionSize,
-			},
-		})
-		require.NoError(t, err)
+			})
+			require.NoError(t, err)
 
-		promArgs := sset.Spec.Template.Spec.Containers[0].Args
-		retentionFlag := strings.Split(test.expectedRetentionArg, "=")[0]
-		foundRetentionFlag := false
-		foundRetentionSizeFlag := false
-		foundRetention := false
-		foundRetentionSize := false
-		for _, flag := range promArgs {
-			if flag == test.expectedRetentionArg {
-				foundRetention = true
-			} else if flag == test.expectedRetentionSizeArg {
-				foundRetentionSize = true
+			promArgs := sset.Spec.Template.Spec.Containers[0].Args
+			retentionFlag, _, _ := strings.Cut(test.expectedRetentionArg, "=")
+			foundRetentionFlag := false
+			foundRetentionSizeFlag := false
+			foundRetention := false
+			foundRetentionSize := false
+			for _, flag := range promArgs {
+				if flag == test.expectedRetentionArg {
+					foundRetention = true
+				} else if flag == test.expectedRetentionSizeArg {
+					foundRetentionSize = true
+				}
+
+				if strings.HasPrefix(flag, retentionFlag) {
+					foundRetentionFlag = true
+				} else if strings.HasPrefix(flag, "--storage.tsdb.retention.size") {
+					foundRetentionSizeFlag = true
+				}
 			}
 
-			if strings.HasPrefix(flag, retentionFlag) {
-				foundRetentionFlag = true
-			} else if strings.HasPrefix(flag, "--storage.tsdb.retention.size") {
-				foundRetentionSizeFlag = true
-			}
-		}
-
-		if foundRetention != test.shouldContainRetention || foundRetentionFlag != test.shouldContainRetention {
 			if test.shouldContainRetention {
-				t.Fatalf("test %d, expected Prometheus args to contain %v, but got %v", i, test.expectedRetentionArg, promArgs)
+				require.True(t, (foundRetention && foundRetentionFlag))
 			} else {
-				t.Fatalf("test %d, expected Prometheus args to NOT contain %v, but got %v", i, test.expectedRetentionArg, promArgs)
+				require.False(t, foundRetentionFlag, "retention flag must not be set for Prometheus %s", test.version)
 			}
-		}
 
-		if foundRetentionSize != test.shouldContainRetentionSize || foundRetentionSizeFlag != test.shouldContainRetentionSize {
 			if test.shouldContainRetentionSize {
-				t.Fatalf("test %d, expected Prometheus args to contain %v, but got %v", i, test.expectedRetentionSizeArg, promArgs)
+				require.True(t, (foundRetentionSize && foundRetentionSizeFlag))
 			} else {
-				t.Fatalf("test %d, expected Prometheus args to NOT contain %v, but got %v", i, test.expectedRetentionSizeArg, promArgs)
+				require.False(t, foundRetentionSizeFlag, "retention size flag must not be set for Prometheus %s", test.version)
 			}
-		}
+		})
 	}
 }
 
 func TestReplicasConfigurationWithSharding(t *testing.T) {
-	testConfig := &operator.Config{
+	testConfig := prompkg.Config{
 		ReloaderConfig:             defaultTestConfig.ReloaderConfig,
 		PrometheusDefaultBaseImage: "quay.io/prometheus/prometheus",
 		ThanosDefaultBaseImage:     "quay.io/thanos/thanos:v0.7.0",
 	}
 	replicas := int32(2)
 	shards := int32(3)
-	logger := newLogger()
+	logger := prompkg.NewLogger()
 	p := monitoringv1.Prometheus{
 		Spec: monitoringv1.PrometheusSpec{
 			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
@@ -1495,34 +1476,21 @@ func TestReplicasConfigurationWithSharding(t *testing.T) {
 		},
 	}
 
-	cg, err := prompkg.NewConfigGenerator(logger, &p, false)
+	cg, err := prompkg.NewConfigGenerator(logger, &p)
 	require.NoError(t, err)
 
 	sset, err := makeStatefulSet(
-		logger,
 		"test",
 		&p,
-		p.Spec.BaseImage, p.Spec.Tag, p.Spec.SHA,
-		p.Spec.Retention,
-		p.Spec.RetentionSize,
-		p.Spec.Rules,
-		p.Spec.Query,
-		p.Spec.AllowOverlappingBlocks,
-		p.Spec.EnableAdminAPI,
-		p.Spec.QueryLogFile,
-		p.Spec.Thanos,
-		p.Spec.DisableCompaction,
 		testConfig,
 		cg,
 		nil,
 		"",
 		1,
-		nil)
+		&operator.ShardedSecret{})
 	require.NoError(t, err)
 
-	if *sset.Spec.Replicas != int32(2) {
-		t.Fatal("Unexpected replicas configuration.")
-	}
+	require.Equal(t, int32(2), *sset.Spec.Replicas, "Unexpected replicas configuration.")
 
 	found := false
 	for _, c := range sset.Spec.Template.Spec.Containers {
@@ -1534,50 +1502,36 @@ func TestReplicasConfigurationWithSharding(t *testing.T) {
 			}
 		}
 	}
-	if !found {
-		t.Fatal("Shard.")
-	}
+	require.True(t, found, "Shard.")
 }
 
 func TestSidecarResources(t *testing.T) {
 	operator.TestSidecarsResources(t, func(reloaderConfig operator.ContainerConfig) *appsv1.StatefulSet {
-		testConfig := &operator.Config{
+		testConfig := prompkg.Config{
 			ReloaderConfig:             reloaderConfig,
 			PrometheusDefaultBaseImage: defaultTestConfig.PrometheusDefaultBaseImage,
 			ThanosDefaultBaseImage:     defaultTestConfig.ThanosDefaultBaseImage,
 		}
-		logger := newLogger()
+		logger := prompkg.NewLogger()
 		p := monitoringv1.Prometheus{
 			Spec: monitoringv1.PrometheusSpec{},
 		}
 
-		cg, err := prompkg.NewConfigGenerator(logger, &p, false)
+		cg, err := prompkg.NewConfigGenerator(logger, &p)
 		require.NoError(t, err)
 
 		sset, err := makeStatefulSet(
-			logger,
 			"test",
 			&p,
-			p.Spec.BaseImage, p.Spec.Tag, p.Spec.SHA,
-			p.Spec.Retention,
-			p.Spec.RetentionSize,
-			p.Spec.Rules,
-			p.Spec.Query,
-			p.Spec.AllowOverlappingBlocks,
-			p.Spec.EnableAdminAPI,
-			p.Spec.QueryLogFile,
-			p.Spec.Thanos,
-			p.Spec.DisableCompaction,
 			testConfig,
 			cg,
 			nil,
 			"",
 			0,
-			nil)
+			&operator.ShardedSecret{})
 		require.NoError(t, err)
 		return sset
 	})
-
 }
 
 func TestAdditionalContainers(t *testing.T) {
@@ -1589,7 +1543,7 @@ func TestAdditionalContainers(t *testing.T) {
 	addSset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		Spec: monitoringv1.PrometheusSpec{
 			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
-				Containers: []v1.Container{
+				Containers: []corev1.Container{
 					{
 						Name: "extra-container",
 					},
@@ -1599,9 +1553,7 @@ func TestAdditionalContainers(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	if len(baseSet.Spec.Template.Spec.Containers)+1 != len(addSset.Spec.Template.Spec.Containers) {
-		t.Fatalf("container count mismatch")
-	}
+	require.Len(t, addSset.Spec.Template.Spec.Containers, len(baseSet.Spec.Template.Spec.Containers)+1, "container count mismatch")
 
 	// Adding a new container with the same name results in a merge and just one container
 	const existingContainerName = "prometheus"
@@ -1609,7 +1561,7 @@ func TestAdditionalContainers(t *testing.T) {
 	modSset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		Spec: monitoringv1.PrometheusSpec{
 			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
-				Containers: []v1.Container{
+				Containers: []corev1.Container{
 					{
 						Name:  existingContainerName,
 						Image: containerImage,
@@ -1620,15 +1572,11 @@ func TestAdditionalContainers(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	if len(baseSet.Spec.Template.Spec.Containers) != len(modSset.Spec.Template.Spec.Containers) {
-		t.Fatalf("container count mismatch. container %s was added instead of merged", existingContainerName)
-	}
+	require.Equal(t, len(baseSet.Spec.Template.Spec.Containers), len(modSset.Spec.Template.Spec.Containers), "container count mismatch. container %s was added instead of merged", existingContainerName)
 
 	// Check that adding a container with an existing name results in a single patched container.
 	for _, c := range modSset.Spec.Template.Spec.Containers {
-		if c.Name == existingContainerName && c.Image != containerImage {
-			t.Fatalf("expected container %s to have the image %s but got %s", existingContainerName, containerImage, c.Image)
-		}
+		require.False(t, (c.Name == existingContainerName && c.Image != containerImage), "expected container %s to have the image %s but got %s", existingContainerName, containerImage, c.Image)
 	}
 }
 
@@ -1666,21 +1614,7 @@ func TestWALCompression(t *testing.T) {
 		require.NoError(t, err)
 
 		promArgs := sset.Spec.Template.Spec.Containers[0].Args
-		found := false
-		for _, flag := range promArgs {
-			if flag == test.expectedArg {
-				found = true
-				break
-			}
-		}
-
-		if found != test.shouldContain {
-			if test.shouldContain {
-				t.Fatalf("expected Prometheus args to contain %v, but got %v", test.expectedArg, promArgs)
-			} else {
-				t.Fatalf("expected Prometheus args to NOT contain %v, but got %v", test.expectedArg, promArgs)
-			}
-		}
+		require.Equal(t, test.shouldContain, slices.Contains(promArgs, test.expectedArg))
 	}
 }
 
@@ -1709,21 +1643,66 @@ func TestTSDBAllowOverlappingBlocks(t *testing.T) {
 		require.NoError(t, err)
 
 		promArgs := sset.Spec.Template.Spec.Containers[0].Args
-		found := false
-		for _, flag := range promArgs {
-			if flag == expectedArg {
-				found = true
-				break
-			}
-		}
+		require.Equal(t, test.shouldContain, slices.Contains(promArgs, expectedArg))
+	}
+}
 
-		if found != test.shouldContain {
-			if test.shouldContain {
-				t.Fatalf("expected Prometheus args to contain %v, but got %v", expectedArg, promArgs)
-			} else {
-				t.Fatalf("expected Prometheus args to NOT contain %v, but got %v", expectedArg, promArgs)
-			}
-		}
+func TestTSDBAllowOverlappingCompaction(t *testing.T) {
+	expectedArg := "--no-storage.tsdb.allow-overlapping-compaction"
+	tests := []struct {
+		name                    string
+		version                 string
+		outOfOrderTimeWindow    monitoringv1.Duration
+		objectStorageConfigFile *string
+		shouldContain           bool
+	}{
+		{
+			name:          "Prometheus version less than or equal to v2.55.0",
+			version:       "v2.54.0",
+			shouldContain: false,
+		},
+		{
+			name:          "outOfOrderTimeWindow equal to 0s",
+			version:       "v2.55.0",
+			shouldContain: false,
+		},
+		{
+			name:                    "Thanos is not object storage",
+			version:                 "v2.55.0",
+			outOfOrderTimeWindow:    "1s",
+			objectStorageConfigFile: nil,
+			shouldContain:           false,
+		},
+		{
+			name:                    "Verify AllowOverlappingCompaction",
+			version:                 "v2.55.0",
+			outOfOrderTimeWindow:    "1s",
+			objectStorageConfigFile: new("/etc/thanos.cfg"),
+			shouldContain:           true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				Spec: monitoringv1.PrometheusSpec{
+					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+						Version: test.version,
+						TSDB: &monitoringv1.TSDBSpec{
+							OutOfOrderTimeWindow: new(test.outOfOrderTimeWindow),
+						},
+					},
+					Thanos: &monitoringv1.ThanosSpec{
+						ListenLocal:             true,
+						ObjectStorageConfigFile: test.objectStorageConfigFile,
+					},
+				},
+			})
+			require.NoError(t, err)
+
+			promArgs := sset.Spec.Template.Spec.Containers[0].Args
+			require.Equal(t, test.shouldContain, slices.Contains(promArgs, expectedArg))
+		})
 	}
 }
 
@@ -1777,16 +1756,11 @@ func TestThanosListenLocal(t *testing.T) {
 
 			for _, exp := range tc.expected {
 				var found bool
-				for _, flag := range sset.Spec.Template.Spec.Containers[2].Args {
-					if flag == exp {
-						found = true
-						break
-					}
+				if slices.Contains(sset.Spec.Template.Spec.Containers[2].Args, exp) {
+					found = true
 				}
 
-				if !found {
-					t.Fatalf("Expecting argument %q but not found in %v", exp, sset.Spec.Template.Spec.Containers[2].Args)
-				}
+				require.True(t, found, "Expecting argument %q but not found in %v", exp, sset.Spec.Template.Spec.Containers[2].Args)
 			}
 		})
 	}
@@ -1797,9 +1771,7 @@ func TestTerminationPolicy(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, c := range sset.Spec.Template.Spec.Containers {
-		if c.TerminationMessagePolicy != v1.TerminationMessageFallbackToLogsOnError {
-			t.Fatalf("Unexpected TermintationMessagePolicy. Expected %v got %v", v1.TerminationMessageFallbackToLogsOnError, c.TerminationMessagePolicy)
-		}
+		require.Equal(t, corev1.TerminationMessageFallbackToLogsOnError, c.TerminationMessagePolicy, "Unexpected TermintationMessagePolicy. Expected %v got %v", corev1.TerminationMessageFallbackToLogsOnError, c.TerminationMessagePolicy)
 	}
 }
 
@@ -1807,7 +1779,7 @@ func TestEnableFeaturesWithOneFeature(t *testing.T) {
 	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		Spec: monitoringv1.PrometheusSpec{
 			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
-				EnableFeatures: []string{"exemplar-storage"},
+				EnableFeatures: []monitoringv1.EnableFeature{"exemplar-storage"},
 			},
 		},
 	})
@@ -1820,16 +1792,14 @@ func TestEnableFeaturesWithOneFeature(t *testing.T) {
 		}
 	}
 
-	if !found {
-		t.Fatal("Prometheus enabled feature is not correctly set.")
-	}
+	require.True(t, found, "Prometheus enabled feature is not correctly set.")
 }
 
 func TestEnableFeaturesWithMultipleFeature(t *testing.T) {
 	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		Spec: monitoringv1.PrometheusSpec{
 			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
-				EnableFeatures: []string{"exemplar-storage1", "exemplar-storage2"},
+				EnableFeatures: []monitoringv1.EnableFeature{"exemplar-storage1", "exemplar-storage2"},
 			},
 		},
 	})
@@ -1842,8 +1812,60 @@ func TestEnableFeaturesWithMultipleFeature(t *testing.T) {
 		}
 	}
 
-	if !found {
-		t.Fatal("Prometheus enabled features are not correctly set.")
+	require.True(t, found, "Prometheus enabled features are not correctly set.")
+}
+
+func TestAutoEnableXOR2EncodingFeature(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		chunkEncoding  *monitoringv1.ChunkEncodingSpec
+		enableFeatures []monitoringv1.EnableFeature
+		expectedFlag   bool
+	}{
+		{
+			name:          "no chunk encoding",
+			chunkEncoding: nil,
+			expectedFlag:  false,
+		},
+		{
+			name: "chunk encoding xor",
+			chunkEncoding: &monitoringv1.ChunkEncodingSpec{
+				Floats: ptr.To(monitoringv1.ChunkEncodingFloatsXor),
+			},
+			expectedFlag: false,
+		},
+		{
+			name: "chunk encoding xor2 auto-enables feature",
+			chunkEncoding: &monitoringv1.ChunkEncodingSpec{
+				Floats: ptr.To(monitoringv1.ChunkEncodingFloatsXor2),
+			},
+			expectedFlag: true,
+		},
+		{
+			name: "chunk encoding xor2 with user feature flag - no duplicate",
+			chunkEncoding: &monitoringv1.ChunkEncodingSpec{
+				Floats: ptr.To(monitoringv1.ChunkEncodingFloatsXor2),
+			},
+			enableFeatures: []monitoringv1.EnableFeature{"xor2-encoding"},
+			expectedFlag:   true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				Spec: monitoringv1.PrometheusSpec{
+					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+						Version:        "v3.13.0",
+						TSDB:           &monitoringv1.TSDBSpec{ChunkEncoding: tc.chunkEncoding},
+						EnableFeatures: tc.enableFeatures,
+					},
+				},
+			})
+			require.NoError(t, err)
+
+			promArgs := sset.Spec.Template.Spec.Containers[0].Args
+			found := slices.Contains(promArgs, "--enable-feature=xor2-encoding")
+			require.Equal(t, tc.expectedFlag, found, "xor2-encoding feature flag mismatch. Args: %v", promArgs)
+		})
 	}
 }
 
@@ -1867,9 +1889,7 @@ func TestWebPageTitle(t *testing.T) {
 		}
 	}
 
-	if !found {
-		t.Fatal("Prometheus web page title is not correctly set.")
-	}
+	require.True(t, found, "Prometheus web page title is not correctly set.")
 }
 
 func TestMaxConnections(t *testing.T) {
@@ -1892,9 +1912,7 @@ func TestMaxConnections(t *testing.T) {
 		}
 	}
 
-	if !found {
-		t.Fatal("Prometheus web max connections is not correctly set.")
-	}
+	require.True(t, found, "Prometheus web max connections is not correctly set.")
 }
 
 func TestExpectedStatefulSetShardNames(t *testing.T) {
@@ -1919,9 +1937,7 @@ func TestExpectedStatefulSetShardNames(t *testing.T) {
 	}
 
 	for i, name := range expected {
-		if res[i] != name {
-			t.Fatal("Unexpected StatefulSet shard name")
-		}
+		require.Equal(t, name, res[i], "Unexpected StatefulSet shard name")
 	}
 }
 
@@ -1932,53 +1948,37 @@ func TestExpectStatefulSetMinReadySeconds(t *testing.T) {
 	require.NoError(t, err)
 
 	// assert defaults to zero if nil
-	if sset.Spec.MinReadySeconds != 0 {
-		t.Fatalf("expected MinReadySeconds to be zero but got %d", sset.Spec.MinReadySeconds)
-	}
+	require.Equal(t, int32(0), sset.Spec.MinReadySeconds)
 
-	var expect uint32 = 5
 	sset, err = makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		Spec: monitoringv1.PrometheusSpec{
 			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
-				MinReadySeconds: &expect,
+				MinReadySeconds: new(int32(5)),
 			},
 		},
 	})
 	require.NoError(t, err)
 
-	if sset.Spec.MinReadySeconds != int32(expect) {
-		t.Fatalf("expected MinReadySeconds to be %d but got %d", expect, sset.Spec.MinReadySeconds)
-	}
+	require.Equal(t, int32(5), sset.Spec.MinReadySeconds)
 }
 
 func TestConfigReloader(t *testing.T) {
 	expectedShardNum := 0
-	logger := newLogger()
+	logger := prompkg.NewLogger()
 	p := monitoringv1.Prometheus{}
 
-	cg, err := prompkg.NewConfigGenerator(logger, &p, false)
+	cg, err := prompkg.NewConfigGenerator(logger, &p)
 	require.NoError(t, err)
 
 	sset, err := makeStatefulSet(
-		logger,
 		"test",
 		&p,
-		p.Spec.BaseImage, p.Spec.Tag, p.Spec.SHA,
-		p.Spec.Retention,
-		p.Spec.RetentionSize,
-		p.Spec.Rules,
-		p.Spec.Query,
-		p.Spec.AllowOverlappingBlocks,
-		p.Spec.EnableAdminAPI,
-		p.Spec.QueryLogFile,
-		p.Spec.Thanos,
-		p.Spec.DisableCompaction,
 		defaultTestConfig,
 		cg,
 		nil,
 		"",
 		int32(expectedShardNum),
-		nil)
+		&operator.ShardedSecret{})
 	require.NoError(t, err)
 
 	expectedArgsConfigReloader := []string{
@@ -1986,17 +1986,14 @@ func TestConfigReloader(t *testing.T) {
 		"--reload-url=http://localhost:9090/-/reload",
 		"--config-file=/etc/prometheus/config/prometheus.yaml.gz",
 		"--config-envsubst-file=/etc/prometheus/config_out/prometheus.env.yaml",
+		"--watched-dir=/etc/prometheus/config",
 	}
 
 	for _, c := range sset.Spec.Template.Spec.Containers {
 		if c.Name == "config-reloader" {
-			if !reflect.DeepEqual(c.Args, expectedArgsConfigReloader) {
-				t.Fatalf("expectd container args are %s, but found %s", expectedArgsConfigReloader, c.Args)
-			}
+			require.Equal(t, expectedArgsConfigReloader, c.Args, "expectd container args are %s, but found %s", expectedArgsConfigReloader, c.Args)
 			for _, env := range c.Env {
-				if env.Name == "SHARD" && !reflect.DeepEqual(env.Value, strconv.Itoa(expectedShardNum)) {
-					t.Fatalf("expectd shard value is %s, but found %s", strconv.Itoa(expectedShardNum), env.Value)
-				}
+				require.False(t, (env.Name == "SHARD" && !reflect.DeepEqual(env.Value, strconv.Itoa(expectedShardNum))), "expectd shard value is %s, but found %s", strconv.Itoa(expectedShardNum), env.Value)
 			}
 		}
 	}
@@ -2006,16 +2003,82 @@ func TestConfigReloader(t *testing.T) {
 		"--listen-address=:8080",
 		"--config-file=/etc/prometheus/config/prometheus.yaml.gz",
 		"--config-envsubst-file=/etc/prometheus/config_out/prometheus.env.yaml",
+		"--watched-dir=/etc/prometheus/config",
 	}
 
 	for _, c := range sset.Spec.Template.Spec.Containers {
 		if c.Name == "init-config-reloader" {
-			if !reflect.DeepEqual(c.Args, expectedArgsConfigReloader) {
-				t.Fatalf("expectd init container args are %s, but found %s", expectedArgsInitConfigReloader, c.Args)
-			}
+			require.Equal(t, expectedArgsInitConfigReloader, c.Args, "expectd init container args are %s, but found %s", expectedArgsInitConfigReloader, c.Args)
 			for _, env := range c.Env {
-				if env.Name == "SHARD" && !reflect.DeepEqual(env.Value, strconv.Itoa(expectedShardNum)) {
-					t.Fatalf("expectd shard value is %s, but found %s", strconv.Itoa(expectedShardNum), env.Value)
+				require.False(t, (env.Name == "SHARD" && !reflect.DeepEqual(env.Value, strconv.Itoa(expectedShardNum))), "expectd shard value is %s, but found %s", strconv.Itoa(expectedShardNum), env.Value)
+			}
+		}
+	}
+}
+
+func TestConfigReloaderWithSignal(t *testing.T) {
+	expectedShardNum := 0
+	logger := prompkg.NewLogger()
+	p := monitoringv1.Prometheus{
+		Spec: monitoringv1.PrometheusSpec{
+			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				ReloadStrategy: func(r monitoringv1.ReloadStrategyType) *monitoringv1.ReloadStrategyType { return &r }(monitoringv1.ProcessSignalReloadStrategyType),
+			},
+		},
+	}
+
+	cg, err := prompkg.NewConfigGenerator(logger, &p)
+	require.NoError(t, err)
+
+	sset, err := makeStatefulSet(
+		"test",
+		&p,
+		defaultTestConfig,
+		cg,
+		nil,
+		"",
+		int32(expectedShardNum),
+		&operator.ShardedSecret{})
+	require.NoError(t, err)
+
+	expectedArgsConfigReloader := []string{
+		"--listen-address=:8080",
+		"--reload-method=signal",
+		"--runtimeinfo-url=http://localhost:9090/api/v1/status/runtimeinfo",
+		"--config-file=/etc/prometheus/config/prometheus.yaml.gz",
+		"--config-envsubst-file=/etc/prometheus/config_out/prometheus.env.yaml",
+		"--watched-dir=/etc/prometheus/config",
+	}
+
+	for _, c := range sset.Spec.Template.Spec.Containers {
+		switch c.Name {
+		case "config-reloader":
+			require.Equal(t, expectedArgsConfigReloader, c.Args)
+			for _, env := range c.Env {
+				if env.Name == "SHARD" {
+					require.Equal(t, strconv.Itoa(expectedShardNum), env.Value)
+				}
+			}
+
+		case "prometheus":
+			require.NotContains(t, c.Args, "--web.enable-lifecycle")
+		}
+	}
+
+	expectedArgsInitConfigReloader := []string{
+		"--watch-interval=0",
+		"--listen-address=:8081",
+		"--config-file=/etc/prometheus/config/prometheus.yaml.gz",
+		"--config-envsubst-file=/etc/prometheus/config_out/prometheus.env.yaml",
+		"--watched-dir=/etc/prometheus/config",
+	}
+
+	for _, c := range sset.Spec.Template.Spec.InitContainers {
+		if c.Name == "init-config-reloader" {
+			require.Equal(t, expectedArgsInitConfigReloader, c.Args)
+			for _, env := range c.Env {
+				if env.Name == "SHARD" {
+					require.Equal(t, strconv.Itoa(expectedShardNum), env.Value)
 				}
 			}
 		}
@@ -2043,9 +2106,7 @@ func TestThanosGetConfigInterval(t *testing.T) {
 		}
 	}
 
-	if !found {
-		t.Fatal("Sidecar get_config_interval is not set when it should.")
-	}
+	require.True(t, found, "Sidecar get_config_interval is not set when it should.")
 }
 
 func TestThanosGetConfigTimeout(t *testing.T) {
@@ -2069,9 +2130,7 @@ func TestThanosGetConfigTimeout(t *testing.T) {
 		}
 	}
 
-	if !found {
-		t.Fatal("Sidecar get_config_timeout is not set when it should.")
-	}
+	require.True(t, found, "Sidecar get_config_timeout is not set when it should.")
 }
 
 func TestThanosReadyTimeout(t *testing.T) {
@@ -2095,9 +2154,7 @@ func TestThanosReadyTimeout(t *testing.T) {
 		}
 	}
 
-	if !found {
-		t.Fatal("Sidecar ready timeout not set when it should.")
-	}
+	require.True(t, found, "Sidecar ready timeout not set when it should.")
 }
 
 func TestQueryLogFileVolumeMountPresent(t *testing.T) {
@@ -2110,29 +2167,25 @@ func TestQueryLogFileVolumeMountPresent(t *testing.T) {
 
 	found := false
 	for _, volume := range sset.Spec.Template.Spec.Volumes {
-		if volume.Name == "query-log-file" {
+		if volume.Name == prompkg.DefaultLogFileVolume {
 			found = true
 		}
 	}
 
-	if !found {
-		t.Fatal("Volume for query log file not found.")
-	}
+	require.True(t, found, "Volume for query log file not found.")
 
 	found = false
 	for _, container := range sset.Spec.Template.Spec.Containers {
 		if container.Name == "prometheus" {
 			for _, vm := range container.VolumeMounts {
-				if vm.Name == "query-log-file" {
+				if vm.Name == prompkg.DefaultLogFileVolume {
 					found = true
 				}
 			}
 		}
 	}
 
-	if !found {
-		t.Fatal("Query log file not mounted.")
-	}
+	require.True(t, found, "Query log file not mounted.")
 }
 
 func TestQueryLogFileVolumeMountNotPresent(t *testing.T) {
@@ -2147,48 +2200,116 @@ func TestQueryLogFileVolumeMountNotPresent(t *testing.T) {
 
 	found := false
 	for _, volume := range sset.Spec.Template.Spec.Volumes {
-		if volume.Name == "query-log-file" {
+		if volume.Name == prompkg.DefaultLogFileVolume {
 			found = true
 		}
 	}
 
-	if found {
-		t.Fatal("Volume for query log file found, when it shouldn't be.")
-	}
+	require.False(t, found, "Volume for query log file found, when it shouldn't be.")
 
 	found = false
 	for _, container := range sset.Spec.Template.Spec.Containers {
 		if container.Name == "prometheus" {
 			for _, vm := range container.VolumeMounts {
-				if vm.Name == "query-log-file" {
+				if vm.Name == prompkg.DefaultLogFileVolume {
 					found = true
 				}
 			}
 		}
 	}
 
-	if found {
-		t.Fatal("Query log file mounted, when it shouldn't be.")
-	}
+	require.False(t, found, "Query log file mounted, when it shouldn't be.")
 }
 
-func TestEnableRemoteWriteReceiver(t *testing.T) {
+func TestScrapeFailureLogFileVolumeMountPresent(t *testing.T) {
+	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+		Spec: monitoringv1.PrometheusSpec{
+			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				ScrapeFailureLogFile: new("file.log"),
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	found := false
+	for _, volume := range sset.Spec.Template.Spec.Volumes {
+		if volume.Name == prompkg.DefaultLogFileVolume {
+			found = true
+		}
+	}
+
+	require.True(t, found, "Volume for scrape failure log file not found.")
+
+	found = false
+	for _, container := range sset.Spec.Template.Spec.Containers {
+		if container.Name == "prometheus" {
+			for _, vm := range container.VolumeMounts {
+				if vm.Name == prompkg.DefaultLogFileVolume {
+					found = true
+				}
+			}
+		}
+	}
+
+	require.True(t, found, "Scrape failure log file not mounted.")
+}
+
+func TestScrapeFailureLogFileVolumeMountNotPresent(t *testing.T) {
+	// An emptyDir is only mounted by the Operator if the given
+	// path is only a base filename.
+	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+		Spec: monitoringv1.PrometheusSpec{
+			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				ScrapeFailureLogFile: new("/tmp/file.log"),
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	found := false
+	for _, volume := range sset.Spec.Template.Spec.Volumes {
+		if volume.Name == prompkg.DefaultLogFileVolume {
+			found = true
+		}
+	}
+
+	require.False(t, found, "Volume for scrape failure file found, when it shouldn't be.")
+
+	found = false
+	for _, container := range sset.Spec.Template.Spec.Containers {
+		if container.Name == "prometheus" {
+			for _, vm := range container.VolumeMounts {
+				if vm.Name == prompkg.DefaultLogFileVolume {
+					found = true
+				}
+			}
+		}
+	}
+
+	require.False(t, found, "Scrape failure log file mounted, when it shouldn't be.")
+}
+
+func TestRemoteWriteReceiver(t *testing.T) {
 	for _, tc := range []struct {
-		version                         string
-		enableRemoteWriteReceiver       bool
+		version                   string
+		enableRemoteWriteReceiver bool
+		messageVersions           []monitoringv1.RemoteWriteMessageVersion
+
 		expectedRemoteWriteReceiverFlag bool
+		expectedMessageVersions         string
 	}{
-		// Test lower version where feature not available
+		// Remote write receiver not supported.
 		{
 			version:                   "2.32.0",
 			enableRemoteWriteReceiver: true,
 		},
-		// Test correct version from which feature available
+		// Remote write receiver supported starting with v2.33.0.
 		{
 			version:                         "2.33.0",
 			enableRemoteWriteReceiver:       true,
 			expectedRemoteWriteReceiverFlag: true,
 		},
+		// Remote write receiver supported but not enabled.
 		{
 			version:                         "2.33.0",
 			enableRemoteWriteReceiver:       false,
@@ -2200,29 +2321,67 @@ func TestEnableRemoteWriteReceiver(t *testing.T) {
 			enableRemoteWriteReceiver:       true,
 			expectedRemoteWriteReceiverFlag: true,
 		},
+		// RemoteWriteMessageVersions not supported.
+		{
+			version:                         "2.53.0",
+			enableRemoteWriteReceiver:       true,
+			expectedRemoteWriteReceiverFlag: true,
+			messageVersions: []monitoringv1.RemoteWriteMessageVersion{
+				monitoringv1.RemoteWriteMessageVersion2_0,
+			},
+		},
+		// RemoteWriteMessageVersions supported and set to one value.
+		{
+			version:                   "2.54.0",
+			enableRemoteWriteReceiver: true,
+			messageVersions: []monitoringv1.RemoteWriteMessageVersion{
+				monitoringv1.RemoteWriteMessageVersion2_0,
+			},
+			expectedRemoteWriteReceiverFlag: true,
+			expectedMessageVersions:         "io.prometheus.write.v2.Request",
+		},
+		// RemoteWriteMessageVersions supported and set to 2 values.
+		{
+			version:                   "2.54.0",
+			enableRemoteWriteReceiver: true,
+			messageVersions: []monitoringv1.RemoteWriteMessageVersion{
+				monitoringv1.RemoteWriteMessageVersion1_0,
+				monitoringv1.RemoteWriteMessageVersion2_0,
+			},
+			expectedRemoteWriteReceiverFlag: true,
+			expectedMessageVersions:         "prometheus.WriteRequest,io.prometheus.write.v2.Request",
+		},
 	} {
-		t.Run(fmt.Sprintf("case %s", tc.version), func(t *testing.T) {
-			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+		t.Run(tc.version, func(t *testing.T) {
+			p := monitoringv1.Prometheus{
 				Spec: monitoringv1.PrometheusSpec{
 					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
-						Version:                   tc.version,
-						EnableRemoteWriteReceiver: tc.enableRemoteWriteReceiver,
+						Version:                            tc.version,
+						EnableRemoteWriteReceiver:          tc.enableRemoteWriteReceiver,
+						RemoteWriteReceiverMessageVersions: tc.messageVersions,
 					},
 				},
-			})
+			}
+			sset, err := makeStatefulSetFromPrometheus(p)
 			require.NoError(t, err)
 
-			found := false
+			var (
+				enabled         bool
+				messageVersions string
+			)
 			for _, flag := range sset.Spec.Template.Spec.Containers[0].Args {
-				if flag == "--web.enable-remote-write-receiver" {
-					found = true
-					break
+				flag = strings.TrimPrefix(flag, "--")
+				values := strings.Split(flag, "=")
+				switch values[0] {
+				case "web.enable-remote-write-receiver":
+					enabled = true
+				case "web.remote-write-receiver.accepted-protobuf-messages":
+					messageVersions = values[1]
 				}
 			}
 
-			if found != tc.expectedRemoteWriteReceiverFlag {
-				t.Fatalf("Expecting Prometheus remote write receiver to be %t, got %t", tc.expectedRemoteWriteReceiverFlag, found)
-			}
+			require.Equal(t, tc.expectedRemoteWriteReceiverFlag, enabled)
+			require.Equal(t, tc.expectedMessageVersions, messageVersions)
 		})
 	}
 }
@@ -2231,28 +2390,28 @@ func TestPodTemplateConfig(t *testing.T) {
 	nodeSelector := map[string]string{
 		"foo": "bar",
 	}
-	affinity := v1.Affinity{
-		NodeAffinity: &v1.NodeAffinity{},
-		PodAffinity: &v1.PodAffinity{
-			PreferredDuringSchedulingIgnoredDuringExecution: []v1.WeightedPodAffinityTerm{
+	affinity := corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{},
+		PodAffinity: &corev1.PodAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
 				{
-					PodAffinityTerm: v1.PodAffinityTerm{
+					PodAffinityTerm: corev1.PodAffinityTerm{
 						Namespaces: []string{"foo"},
 					},
 					Weight: 100,
 				},
 			},
 		},
-		PodAntiAffinity: &v1.PodAntiAffinity{},
+		PodAntiAffinity: &corev1.PodAntiAffinity{},
 	}
 
-	tolerations := []v1.Toleration{
+	tolerations := []corev1.Toleration{
 		{
 			Key: "key",
 		},
 	}
 	userid := int64(1234)
-	securityContext := v1.PodSecurityContext{
+	securityContext := corev1.PodSecurityContext{
 		RunAsUser: &userid,
 	}
 	priorityClassName := "foo"
@@ -2263,14 +2422,16 @@ func TestPodTemplateConfig(t *testing.T) {
 			IP:        "1.1.1.1",
 		},
 	}
-	imagePullPolicy := v1.PullAlways
-	imagePullSecrets := []v1.LocalObjectReference{
+	imagePullPolicy := corev1.PullAlways
+	imagePullSecrets := []corev1.LocalObjectReference{
 		{
 			Name: "registry-secret",
 		},
 	}
+	schedulerName := "my-scheduler"
 
 	hostNetwork := false
+	hostUsers := true
 
 	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
 		ObjectMeta: metav1.ObjectMeta{},
@@ -2285,55 +2446,35 @@ func TestPodTemplateConfig(t *testing.T) {
 				HostAliases:        hostAliases,
 				ImagePullPolicy:    imagePullPolicy,
 				ImagePullSecrets:   imagePullSecrets,
+				SchedulerName:      schedulerName,
 				HostNetwork:        hostNetwork,
+				HostUsers:          new(true),
 			},
 		},
 	})
 	require.NoError(t, err)
 
-	if !reflect.DeepEqual(sset.Spec.Template.Spec.NodeSelector, nodeSelector) {
-		t.Fatalf("expected node selector to match, want %v, got %v", nodeSelector, sset.Spec.Template.Spec.NodeSelector)
-	}
-	if !reflect.DeepEqual(*sset.Spec.Template.Spec.Affinity, affinity) {
-		t.Fatalf("expected affinity to match, want %v, got %v", affinity, *sset.Spec.Template.Spec.Affinity)
-	}
-	if !reflect.DeepEqual(sset.Spec.Template.Spec.Tolerations, tolerations) {
-		t.Fatalf("expected tolerations to match, want %v, got %v", tolerations, sset.Spec.Template.Spec.Tolerations)
-	}
-	if !reflect.DeepEqual(*sset.Spec.Template.Spec.SecurityContext, securityContext) {
-		t.Fatalf("expected security context  to match, want %v, got %v", securityContext, *sset.Spec.Template.Spec.SecurityContext)
-	}
-	if sset.Spec.Template.Spec.PriorityClassName != priorityClassName {
-		t.Fatalf("expected priority class name to match, want %s, got %s", priorityClassName, sset.Spec.Template.Spec.PriorityClassName)
-	}
-	if sset.Spec.Template.Spec.ServiceAccountName != serviceAccountName {
-		t.Fatalf("expected service account name to match, want %s, got %s", serviceAccountName, sset.Spec.Template.Spec.ServiceAccountName)
-	}
-	if len(sset.Spec.Template.Spec.HostAliases) != len(hostAliases) {
-		t.Fatalf("expected length of host aliases to match, want %d, got %d", len(hostAliases), len(sset.Spec.Template.Spec.HostAliases))
-	}
+	require.Equal(t, nodeSelector, sset.Spec.Template.Spec.NodeSelector, "expected node selector to match, want %v, got %v", nodeSelector, sset.Spec.Template.Spec.NodeSelector)
+	require.Equal(t, affinity, *sset.Spec.Template.Spec.Affinity, "expected affinity to match, want %v, got %v", affinity, *sset.Spec.Template.Spec.Affinity)
+	require.Equal(t, tolerations, sset.Spec.Template.Spec.Tolerations, "expected tolerations to match, want %v, got %v", tolerations, sset.Spec.Template.Spec.Tolerations)
+	require.Equal(t, securityContext, *sset.Spec.Template.Spec.SecurityContext, "expected security context  to match, want %v, got %v", securityContext, *sset.Spec.Template.Spec.SecurityContext)
+	require.Equal(t, priorityClassName, sset.Spec.Template.Spec.PriorityClassName, "expected priority class name to match, want %s, got %s", priorityClassName, sset.Spec.Template.Spec.PriorityClassName)
+	require.Equal(t, serviceAccountName, sset.Spec.Template.Spec.ServiceAccountName, "expected service account name to match, want %s, got %s", serviceAccountName, sset.Spec.Template.Spec.ServiceAccountName)
+	require.Equal(t, schedulerName, sset.Spec.Template.Spec.SchedulerName, "expected scheduler name to match, want %s, got %s", schedulerName, sset.Spec.Template.Spec.SchedulerName)
+	require.Len(t, sset.Spec.Template.Spec.HostAliases, len(hostAliases), "expected length of host aliases to match, want %d, got %d", len(hostAliases), len(sset.Spec.Template.Spec.HostAliases))
+	require.Equal(t, hostUsers, *sset.Spec.Template.Spec.HostUsers, "expected host users to match, want %s, got %s", hostUsers, sset.Spec.Template.Spec.HostUsers)
 	for _, initContainer := range sset.Spec.Template.Spec.InitContainers {
-		if !reflect.DeepEqual(initContainer.ImagePullPolicy, imagePullPolicy) {
-			t.Fatalf("expected imagePullPolicy to match, want %s, got %s", imagePullPolicy, sset.Spec.Template.Spec.Containers[0].ImagePullPolicy)
-		}
+		require.Equal(t, imagePullPolicy, initContainer.ImagePullPolicy, "expected imagePullPolicy to match, want %s, got %s", imagePullPolicy, initContainer.ImagePullPolicy)
 	}
 	for _, container := range sset.Spec.Template.Spec.Containers {
-		if !reflect.DeepEqual(container.ImagePullPolicy, imagePullPolicy) {
-			t.Fatalf("expected imagePullPolicy to match, want %s, got %s", imagePullPolicy, sset.Spec.Template.Spec.Containers[0].ImagePullPolicy)
-		}
+		require.Equal(t, imagePullPolicy, container.ImagePullPolicy, "expected imagePullPolicy to match, want %s, got %s", imagePullPolicy, container.ImagePullPolicy)
 	}
-	if !reflect.DeepEqual(sset.Spec.Template.Spec.ImagePullSecrets, imagePullSecrets) {
-		t.Fatalf("expected image pull secrets to match, want %s, got %s", imagePullSecrets, sset.Spec.Template.Spec.ImagePullSecrets)
-	}
-	if sset.Spec.Template.Spec.HostNetwork != hostNetwork {
-		t.Fatalf("expected hostNetwork configuration to match but failed")
-	}
+	require.Equal(t, imagePullSecrets, sset.Spec.Template.Spec.ImagePullSecrets, "expected image pull secrets to match, want %s, got %s", imagePullSecrets, sset.Spec.Template.Spec.ImagePullSecrets)
+	require.Equal(t, hostNetwork, sset.Spec.Template.Spec.HostNetwork, "expected hostNetwork configuration to match but failed")
 }
 
 func TestPrometheusAdditionalArgsNoError(t *testing.T) {
-	expectedPrometheusArgs := []string{
-		"--web.console.templates=/etc/prometheus/consoles",
-		"--web.console.libraries=/etc/prometheus/console_libraries",
+	expectedPrometheusArgsV3 := []string{
 		"--config.file=/etc/prometheus/config_out/prometheus.env.yaml",
 		"--web.enable-lifecycle",
 		"--web.route-prefix=/",
@@ -2344,37 +2485,68 @@ func TestPrometheusAdditionalArgsNoError(t *testing.T) {
 		"--storage.tsdb.no-lockfile",
 	}
 
-	labels := map[string]string{
-		"testlabel": "testlabelvalue",
-	}
-	annotations := map[string]string{
-		"testannotation": "testannotationvalue",
+	expectedPrometheusArgsV2 := []string{
+		"--config.file=/etc/prometheus/config_out/prometheus.env.yaml",
+		"--web.console.templates=/etc/prometheus/consoles",
+		"--web.console.libraries=/etc/prometheus/console_libraries",
+		"--web.enable-lifecycle",
+		"--web.route-prefix=/",
+		"--storage.tsdb.retention.time=24h",
+		"--storage.tsdb.path=/prometheus",
+		"--web.config.file=/etc/prometheus/web_config/web-config.yaml",
+		"--scrape.discovery-reload-interval=30s",
+		"--storage.tsdb.no-lockfile",
 	}
 
-	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
-		ObjectMeta: metav1.ObjectMeta{
-			Labels:      labels,
-			Annotations: annotations,
+	argTests := []struct {
+		version      string
+		expectedArgs []string
+	}{
+		{
+			version:      "v2.54.0",
+			expectedArgs: expectedPrometheusArgsV2,
 		},
-		Spec: monitoringv1.PrometheusSpec{
-			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
-				AdditionalArgs: []monitoringv1.Argument{
-					{
-						Name:  "scrape.discovery-reload-interval",
-						Value: "30s",
-					},
-					{
-						Name: "storage.tsdb.no-lockfile",
+		{
+			version:      "v3.0.0",
+			expectedArgs: expectedPrometheusArgsV3,
+		},
+	}
+
+	for _, argTest := range argTests {
+		t.Run(argTest.version, func(t *testing.T) {
+			labels := map[string]string{
+				"testlabel": "testlabelvalue",
+			}
+			annotations := map[string]string{
+				"testannotation": "testannotationvalue",
+			}
+
+			p := monitoringv1.Prometheus{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      labels,
+					Annotations: annotations,
+				},
+				Spec: monitoringv1.PrometheusSpec{
+					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+						AdditionalArgs: []monitoringv1.Argument{
+							{
+								Name:  "scrape.discovery-reload-interval",
+								Value: "30s",
+							},
+							{
+								Name: "storage.tsdb.no-lockfile",
+							},
+						},
+						Version: argTest.version,
 					},
 				},
-			},
-		},
-	})
-	require.NoError(t, err)
-
-	ssetContainerArgs := sset.Spec.Template.Spec.Containers[0].Args
-	if !reflect.DeepEqual(ssetContainerArgs, expectedPrometheusArgs) {
-		t.Fatalf("expected Prometheus container args to match, want %s, got %s", expectedPrometheusArgs, ssetContainerArgs)
+			}
+			sset, err := makeStatefulSetFromPrometheus(p)
+			require.NoError(t, err)
+			ssetContainerArgs := sset.Spec.Template.Spec.Containers[0].Args
+			// web.console.templates and web.console.libraries should be present in prometheus versisons < 3
+			require.Equal(t, argTest.expectedArgs, ssetContainerArgs, "expected Prometheus container args to match, want %s, got %s", argTest.expectedArgs, ssetContainerArgs)
+		})
 	}
 }
 
@@ -2404,10 +2576,62 @@ func TestPrometheusAdditionalArgsDuplicate(t *testing.T) {
 			},
 		},
 	})
-	require.NotNil(t, err)
+	require.Error(t, err)
 
-	if !strings.Contains(err.Error(), expectedErrorMsg) {
-		t.Fatalf("expected the following text to be present in the error msg: %s", expectedErrorMsg)
+	require.Contains(t, err.Error(), expectedErrorMsg, "expected the following text to be present in the error msg: %s", expectedErrorMsg)
+}
+
+func TestRuntimeGOGCEnvVar(t *testing.T) {
+	for _, tc := range []struct {
+		scenario       string
+		version        string
+		gogc           *int32
+		expectedEnvVar bool
+	}{
+		{
+			scenario:       "Prometheus < 2.53.0",
+			version:        "v2.51.2",
+			gogc:           new(int32(50)),
+			expectedEnvVar: true,
+		},
+		{
+			scenario:       "Prometheus > 2.53.0",
+			version:        "v2.54.0",
+			gogc:           new(int32(50)),
+			expectedEnvVar: false,
+		},
+	} {
+		t.Run(fmt.Sprintf("case %s", tc.scenario), func(t *testing.T) {
+			ss, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				Spec: monitoringv1.PrometheusSpec{
+					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+						Version: tc.version,
+						Runtime: &monitoringv1.RuntimeConfig{
+							GoGC: tc.gogc,
+						},
+					},
+				},
+			})
+
+			var containsEnvVar bool
+			for _, env := range ss.Spec.Template.Spec.Containers[0].Env {
+				if env.Name == "GOGC" {
+					if env.Value == fmt.Sprintf("%d", *tc.gogc) {
+						containsEnvVar = true
+						break
+					}
+				}
+			}
+
+			require.NoError(t, err)
+			if tc.expectedEnvVar {
+				require.True(t, containsEnvVar, "Prometheus is missing expected GOGC env var with correct value")
+			}
+
+			if !tc.expectedEnvVar {
+				require.False(t, containsEnvVar, "Prometheus didn't expect GOGC env var for this version of Prometheus")
+			}
+		})
 	}
 }
 
@@ -2436,15 +2660,13 @@ func TestPrometheusAdditionalBinaryArgsDuplicate(t *testing.T) {
 			},
 		},
 	})
-	require.NotNil(t, err)
+	require.Error(t, err)
 
-	if !strings.Contains(err.Error(), expectedErrorMsg) {
-		t.Fatalf("expected the following text to be present in the error msg: %s", expectedErrorMsg)
-	}
+	require.Contains(t, err.Error(), expectedErrorMsg, "expected the following text to be present in the error msg: %s", expectedErrorMsg)
 }
 
 func TestPrometheusAdditionalNoPrefixArgsDuplicate(t *testing.T) {
-	expectedErrorMsg := "can't set arguments which are already managed by the operator: no-storage.tsdb.wal-compression"
+	expectedErrorMsg := "can't set arguments which are already managed by the operator: storage.tsdb.wal-compression"
 	walCompression := new(bool)
 	*walCompression = true
 
@@ -2471,10 +2693,151 @@ func TestPrometheusAdditionalNoPrefixArgsDuplicate(t *testing.T) {
 			},
 		},
 	})
-	require.NotNil(t, err)
+	require.Error(t, err)
 
-	if !strings.Contains(err.Error(), expectedErrorMsg) {
-		t.Fatalf("expected the following text to be present in the error msg: %s", expectedErrorMsg)
+	require.Contains(t, err.Error(), expectedErrorMsg, "expected the following text to be present in the error msg: %s", expectedErrorMsg)
+}
+
+func TestThanosGrpcArguments(t *testing.T) {
+	expectedThanosArgs := []string{
+		"sidecar",
+		"--prometheus.url=http://localhost:9090/",
+		"--grpc-address=:10901",
+		"--http-address=:10902",
+		"--grpc-server-tls-cert=/tmp/cert",
+		"--grpc-server-tls-key=/tmp/key",
+		"--grpc-server-tls-client-ca=/tmp/ca",
+		"--grpc-server-tls-min-version=1.3",
+		"--prometheus.http-client-file=/etc/thanos/config/prometheus.http-client-file.yaml",
+	}
+
+	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+		Spec: monitoringv1.PrometheusSpec{
+			Thanos: &monitoringv1.ThanosSpec{
+				GRPCServerTLSConfig: &monitoringv1.GRPCServerTLSConfig{
+					TLSConfig: monitoringv1.TLSConfig{
+						SafeTLSConfig: monitoringv1.SafeTLSConfig{
+							MinVersion: ptr.To(monitoringv1.TLSVersion13),
+						},
+						TLSFilesConfig: monitoringv1.TLSFilesConfig{
+							CAFile:   "/tmp/ca",
+							CertFile: "/tmp/cert",
+							KeyFile:  "/tmp/key",
+						},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	ssetContainerArgs := sset.Spec.Template.Spec.Containers[2].Args
+	require.Equal(t, expectedThanosArgs, ssetContainerArgs)
+}
+
+func TestGRPCServerTLSCipherSuites(t *testing.T) {
+	ciphers := []string{"TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384"}
+
+	for _, tc := range []struct {
+		scenario      string
+		version       string
+		cipherSuites  []string
+		shouldHaveArg bool
+	}{
+		{
+			scenario:      "version >= 0.42.0 with cipher suites",
+			version:       "0.42.0",
+			cipherSuites:  ciphers,
+			shouldHaveArg: true,
+		},
+		{
+			scenario:      "version < 0.42.0 with cipher suites",
+			version:       "0.41.0",
+			cipherSuites:  ciphers,
+			shouldHaveArg: false,
+		},
+		{
+			scenario:      "version >= 0.42.0 without cipher suites",
+			version:       "0.42.0",
+			cipherSuites:  nil,
+			shouldHaveArg: false,
+		},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				Spec: monitoringv1.PrometheusSpec{
+					Thanos: &monitoringv1.ThanosSpec{
+						Version: new(tc.version),
+						GRPCServerTLSConfig: &monitoringv1.GRPCServerTLSConfig{
+							CipherSuites: tc.cipherSuites,
+						},
+					},
+				},
+			})
+			require.NoError(t, err)
+
+			thanosArgs := sset.Spec.Template.Spec.Containers[2].Args
+			expectedArgs := []string{
+				"--grpc-server-tls-ciphers=TLS_AES_128_GCM_SHA256",
+				"--grpc-server-tls-ciphers=TLS_AES_256_GCM_SHA384",
+			}
+			for _, expectedArg := range expectedArgs {
+				require.Equal(t, tc.shouldHaveArg, slices.Contains(thanosArgs, expectedArg), "expected %q presence to be %v", expectedArg, tc.shouldHaveArg)
+			}
+		})
+	}
+}
+
+func TestGRPCServerTLSCurves(t *testing.T) {
+	curves := []string{"CurveP256", "X25519"}
+
+	for _, tc := range []struct {
+		scenario      string
+		version       string
+		curves        []string
+		shouldHaveArg bool
+	}{
+		{
+			scenario:      "version >= 0.42.0 with curve preferences",
+			version:       "0.42.0",
+			curves:        curves,
+			shouldHaveArg: true,
+		},
+		{
+			scenario:      "version < 0.42.0 with curve preferences",
+			version:       "0.41.0",
+			curves:        curves,
+			shouldHaveArg: false,
+		},
+		{
+			scenario:      "version >= 0.42.0 without curve preferences",
+			version:       "0.42.0",
+			curves:        nil,
+			shouldHaveArg: false,
+		},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				Spec: monitoringv1.PrometheusSpec{
+					Thanos: &monitoringv1.ThanosSpec{
+						Version: new(tc.version),
+						GRPCServerTLSConfig: &monitoringv1.GRPCServerTLSConfig{
+							Curves: tc.curves,
+						},
+					},
+				},
+			})
+			require.NoError(t, err)
+
+			thanosArgs := sset.Spec.Template.Spec.Containers[2].Args
+			expectedArgs := []string{
+				"--grpc-server-tls-curves=CurveP256",
+				"--grpc-server-tls-curves=X25519",
+			}
+			for _, expectedArg := range expectedArgs {
+				require.Equal(t, tc.shouldHaveArg, slices.Contains(thanosArgs, expectedArg), "expected %q presence to be %v", expectedArg, tc.shouldHaveArg)
+			}
+		})
 	}
 }
 
@@ -2482,10 +2845,10 @@ func TestThanosAdditionalArgsNoError(t *testing.T) {
 	expectedThanosArgs := []string{
 		"sidecar",
 		"--prometheus.url=http://localhost:9090/",
-		`--prometheus.http-client={"tls_config": {"insecure_skip_verify":true}}`,
 		"--grpc-address=:10901",
 		"--http-address=:10902",
 		"--log.level=info",
+		"--prometheus.http-client-file=/etc/thanos/config/prometheus.http-client-file.yaml",
 		"--reloader.watch-interval=5m",
 	}
 
@@ -2516,9 +2879,7 @@ func TestThanosAdditionalArgsNoError(t *testing.T) {
 	require.NoError(t, err)
 
 	ssetContainerArgs := sset.Spec.Template.Spec.Containers[2].Args
-	if !reflect.DeepEqual(ssetContainerArgs, expectedThanosArgs) {
-		t.Fatalf("expected Thanos container args to match, want %s, got %s", expectedThanosArgs, ssetContainerArgs)
-	}
+	require.Equal(t, expectedThanosArgs, ssetContainerArgs, "expected Thanos container args to match, want %s, got %s", expectedThanosArgs, ssetContainerArgs)
 }
 
 func TestThanosAdditionalArgsDuplicate(t *testing.T) {
@@ -2548,16 +2909,12 @@ func TestThanosAdditionalArgsDuplicate(t *testing.T) {
 			},
 		},
 	})
-	require.NotNil(t, err)
+	require.Error(t, err)
 
-	if !strings.Contains(err.Error(), expectedErrorMsg) {
-		t.Fatalf("expected the following text to be present in the error msg: %s", expectedErrorMsg)
-	}
+	require.Contains(t, err.Error(), expectedErrorMsg, "expected the following text to be present in the error msg: %s", expectedErrorMsg)
 }
 
 func TestPrometheusQuerySpec(t *testing.T) {
-	durationPtr := func(s string) *monitoringv1.Duration { d := monitoringv1.Duration(s); return &d }
-
 	for _, tc := range []struct {
 		name string
 
@@ -2575,10 +2932,10 @@ func TestPrometheusQuerySpec(t *testing.T) {
 		},
 		{
 			name:           "all values provided",
-			lookbackDelta:  pointer.String("2m"),
-			maxConcurrency: pointer.Int32(10),
-			maxSamples:     pointer.Int32(10000),
-			timeout:        durationPtr("1m"),
+			lookbackDelta:  new("2m"),
+			maxConcurrency: new(int32(10)),
+			maxSamples:     new(int32(10000)),
+			timeout:        ptr.To(monitoringv1.Duration("1m")),
 
 			expected: []string{
 				"--query.lookback-delta=2m",
@@ -2589,10 +2946,10 @@ func TestPrometheusQuerySpec(t *testing.T) {
 		},
 		{
 			name:           "zero values are skipped",
-			lookbackDelta:  pointer.String("2m"),
-			maxConcurrency: pointer.Int32(0),
-			maxSamples:     pointer.Int32(0),
-			timeout:        durationPtr("1m"),
+			lookbackDelta:  new("2m"),
+			maxConcurrency: new(int32(0)),
+			maxSamples:     new(int32(0)),
+			timeout:        ptr.To(monitoringv1.Duration("1m")),
 
 			expected: []string{
 				"--query.lookback-delta=2m",
@@ -2600,11 +2957,19 @@ func TestPrometheusQuerySpec(t *testing.T) {
 			},
 		},
 		{
+			name:           "maxConcurrency set to 1",
+			maxConcurrency: new(int32(1)),
+
+			expected: []string{
+				"--query.max-concurrency=1",
+			},
+		},
+		{
 			name:           "max samples skipped if version < 2.5",
-			lookbackDelta:  pointer.String("2m"),
-			maxConcurrency: pointer.Int32(10),
-			maxSamples:     pointer.Int32(10000),
-			timeout:        durationPtr("1m"),
+			lookbackDelta:  new("2m"),
+			maxConcurrency: new(int32(10)),
+			maxSamples:     new(int32(10000)),
+			timeout:        ptr.To(monitoringv1.Duration("1m")),
 			version:        "v2.4.0",
 
 			expected: []string{
@@ -2615,10 +2980,10 @@ func TestPrometheusQuerySpec(t *testing.T) {
 		},
 		{
 			name:           "max samples not skipped if version > 2.5",
-			lookbackDelta:  pointer.String("2m"),
-			maxConcurrency: pointer.Int32(10),
-			maxSamples:     pointer.Int32(10000),
-			timeout:        durationPtr("1m"),
+			lookbackDelta:  new("2m"),
+			maxConcurrency: new(int32(10)),
+			maxSamples:     new(int32(10000)),
+			timeout:        ptr.To(monitoringv1.Duration("1m")),
 			version:        "v2.5.0",
 
 			expected: []string{
@@ -2668,15 +3033,11 @@ func TestPrometheusQuerySpec(t *testing.T) {
 				}
 
 				if expected == "" {
-					if containerArg != "" {
-						t.Fatalf("found %q while not expected", containerArg)
-					}
+					require.Equal(t, "", containerArg, "found %q while not expected", containerArg)
 					continue
 				}
 
-				if containerArg != expected {
-					t.Fatalf("expected %q to be found but got %q", expected, containerArg)
-				}
+				require.Equal(t, expected, containerArg, "expected %q to be found but got %q", expected, containerArg)
 			}
 		})
 	}
@@ -2701,7 +3062,7 @@ func TestSecurityContextCapabilities(t *testing.T) {
 			name: "Thanos sidecar with object storage",
 			spec: monitoringv1.PrometheusSpec{
 				Thanos: &monitoringv1.ThanosSpec{
-					ObjectStorageConfigFile: func(s string) *string { return &s }("/etc/thanos.cfg"),
+					ObjectStorageConfigFile: new("/etc/thanos.cfg"),
 				},
 			},
 		},
@@ -2714,22 +3075,13 @@ func TestSecurityContextCapabilities(t *testing.T) {
 			if tc.spec.Thanos != nil {
 				exp++
 			}
-			if len(sset.Spec.Template.Spec.Containers) != exp {
-				t.Fatalf("Expecting %d containers, got %d", exp, len(sset.Spec.Template.Spec.Containers))
-			}
+			require.Len(t, sset.Spec.Template.Spec.Containers, exp, "Expecting %d containers, got %d", exp, len(sset.Spec.Template.Spec.Containers))
 
 			for _, c := range sset.Spec.Template.Spec.Containers {
-				if len(c.SecurityContext.Capabilities.Add) != 0 {
-					t.Fatalf("Expecting 0 added capabilities, got %d", len(c.SecurityContext.Capabilities.Add))
-				}
+				require.Empty(t, c.SecurityContext.Capabilities.Add, "Expecting 0 added capabilities, got %d", len(c.SecurityContext.Capabilities.Add))
+				require.Len(t, c.SecurityContext.Capabilities.Drop, 1, "Expecting 1 dropped capabilities, got %d", len(c.SecurityContext.Capabilities.Drop))
 
-				if len(c.SecurityContext.Capabilities.Drop) != 1 {
-					t.Fatalf("Expecting 1 dropped capabilities, got %d", len(c.SecurityContext.Capabilities.Drop))
-				}
-
-				if string(c.SecurityContext.Capabilities.Drop[0]) != "ALL" {
-					t.Fatalf("Expecting ALL dropped capability, got %s", c.SecurityContext.Capabilities.Drop[0])
-				}
+				require.Equal(t, "ALL", string(c.SecurityContext.Capabilities.Drop[0]), "Expecting ALL dropped capability, got %s", c.SecurityContext.Capabilities.Drop[0])
 			}
 		})
 	}
@@ -2747,11 +3099,611 @@ func TestPodHostNetworkConfig(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	if sset.Spec.Template.Spec.HostNetwork != hostNetwork {
-		t.Fatalf("expected hostNetwork configuration to match but failed")
+	require.Equal(t, hostNetwork, sset.Spec.Template.Spec.HostNetwork, "expected hostNetwork configuration to match but failed")
+	require.Equal(t, corev1.DNSClusterFirstWithHostNet, sset.Spec.Template.Spec.DNSPolicy, "expected DNSPolicy configuration to match due to hostNetwork but failed")
+}
+
+func TestPersistentVolumeClaimRetentionPolicy(t *testing.T) {
+	sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+		ObjectMeta: metav1.ObjectMeta{},
+		Spec: monitoringv1.PrometheusSpec{
+			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+					WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+					WhenScaled:  appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, appsv1.DeletePersistentVolumeClaimRetentionPolicyType, sset.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted, "expected persistentVolumeClaimDeletePolicy.WhenDeleted to be %s but got %s", appsv1.DeletePersistentVolumeClaimRetentionPolicyType, sset.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted)
+	require.Equal(t, appsv1.DeletePersistentVolumeClaimRetentionPolicyType, sset.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled, "expected persistentVolumeClaimDeletePolicy.WhenScaled to be %s but got %s", appsv1.DeletePersistentVolumeClaimRetentionPolicyType, sset.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled)
+}
+
+func TestPodTopologySpreadConstraintWithAdditionalLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec monitoringv1.PrometheusSpec
+		tsc  corev1.TopologySpreadConstraint
+	}{
+		{
+			name: "without labelSelector and additionalLabels",
+			spec: monitoringv1.PrometheusSpec{
+				CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+					TopologySpreadConstraints: []monitoringv1.TopologySpreadConstraint{
+						{
+							CoreV1TopologySpreadConstraint: monitoringv1.CoreV1TopologySpreadConstraint{
+								MaxSkew:           1,
+								TopologyKey:       "kubernetes.io/hostname",
+								WhenUnsatisfiable: corev1.DoNotSchedule,
+							},
+						},
+					},
+				},
+			},
+			tsc: corev1.TopologySpreadConstraint{
+				MaxSkew:           1,
+				TopologyKey:       "kubernetes.io/hostname",
+				WhenUnsatisfiable: corev1.DoNotSchedule,
+			},
+		},
+		{
+			name: "with labelSelector and without additionalLabels",
+			spec: monitoringv1.PrometheusSpec{
+				CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+					TopologySpreadConstraints: []monitoringv1.TopologySpreadConstraint{
+						{
+							CoreV1TopologySpreadConstraint: monitoringv1.CoreV1TopologySpreadConstraint{
+								MaxSkew:           1,
+								TopologyKey:       "kubernetes.io/hostname",
+								WhenUnsatisfiable: corev1.DoNotSchedule,
+								LabelSelector: &metav1.LabelSelector{
+									MatchLabels: map[string]string{
+										"app": "prometheus",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			tsc: corev1.TopologySpreadConstraint{
+				MaxSkew:           1,
+				TopologyKey:       "kubernetes.io/hostname",
+				WhenUnsatisfiable: corev1.DoNotSchedule,
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app": "prometheus",
+					},
+				},
+			},
+		},
+		{
+			name: "with labelSelector and additionalLabels as ShardAndNameResource",
+			spec: monitoringv1.PrometheusSpec{
+				CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+					TopologySpreadConstraints: []monitoringv1.TopologySpreadConstraint{
+						{
+							AdditionalLabelSelectors: ptr.To(monitoringv1.ShardAndResourceNameLabelSelector),
+							CoreV1TopologySpreadConstraint: monitoringv1.CoreV1TopologySpreadConstraint{
+								MaxSkew:           1,
+								TopologyKey:       "kubernetes.io/hostname",
+								WhenUnsatisfiable: corev1.DoNotSchedule,
+								LabelSelector: &metav1.LabelSelector{
+									MatchLabels: map[string]string{
+										"app": "prometheus",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			tsc: corev1.TopologySpreadConstraint{
+				MaxSkew:           1,
+				TopologyKey:       "kubernetes.io/hostname",
+				WhenUnsatisfiable: corev1.DoNotSchedule,
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app":                            "prometheus",
+						"app.kubernetes.io/instance":     "test",
+						"app.kubernetes.io/managed-by":   "prometheus-operator",
+						"prometheus":                     "test",
+						prompkg.ShardLabelName:           "0",
+						prompkg.PrometheusNameLabelName:  "test",
+						operator.ApplicationNameLabelKey: "prometheus",
+					},
+				},
+			},
+		},
+		{
+			name: "with labelSelector and additionalLabels as ResourceName",
+			spec: monitoringv1.PrometheusSpec{
+				CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+					TopologySpreadConstraints: []monitoringv1.TopologySpreadConstraint{
+						{
+							AdditionalLabelSelectors: ptr.To(monitoringv1.ResourceNameLabelSelector),
+							CoreV1TopologySpreadConstraint: monitoringv1.CoreV1TopologySpreadConstraint{
+								MaxSkew:           1,
+								TopologyKey:       "kubernetes.io/hostname",
+								WhenUnsatisfiable: corev1.DoNotSchedule,
+								LabelSelector: &metav1.LabelSelector{
+									MatchLabels: map[string]string{
+										"app": "prometheus",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			tsc: corev1.TopologySpreadConstraint{
+				MaxSkew:           1,
+				TopologyKey:       "kubernetes.io/hostname",
+				WhenUnsatisfiable: corev1.DoNotSchedule,
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app":                            "prometheus",
+						"app.kubernetes.io/instance":     "test",
+						"app.kubernetes.io/managed-by":   "prometheus-operator",
+						"prometheus":                     "test",
+						prompkg.PrometheusNameLabelName:  "test",
+						operator.ApplicationNameLabelKey: "prometheus",
+					},
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sts, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test",
+					Namespace: "ns-test",
+				},
+				Spec: tc.spec,
+			})
+
+			require.NoError(t, err)
+
+			assert.NotEmpty(t, sts.Spec.Template.Spec.TopologySpreadConstraints)
+			assert.Equal(t, tc.tsc, sts.Spec.Template.Spec.TopologySpreadConstraints[0])
+		})
+	}
+}
+
+func TestStartupProbeTimeoutSeconds(t *testing.T) {
+	tests := []struct {
+		maximumStartupDurationSeconds   *int32
+		expectedStartupPeriodSeconds    int32
+		expectedStartupFailureThreshold int32
+	}{
+		{
+			maximumStartupDurationSeconds:   nil,
+			expectedStartupPeriodSeconds:    15,
+			expectedStartupFailureThreshold: 60,
+		},
+		{
+			maximumStartupDurationSeconds:   new(int32(600)),
+			expectedStartupPeriodSeconds:    60,
+			expectedStartupFailureThreshold: 10,
+		},
 	}
 
-	if sset.Spec.Template.Spec.DNSPolicy != v1.DNSClusterFirstWithHostNet {
-		t.Fatalf("expected DNSPolicy configuration to match due to hostNetwork but failed")
+	for _, test := range tests {
+		sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+			ObjectMeta: metav1.ObjectMeta{},
+			Spec: monitoringv1.PrometheusSpec{
+				CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+					MaximumStartupDurationSeconds: test.maximumStartupDurationSeconds,
+				},
+			},
+		})
+
+		require.NoError(t, err)
+		require.NotNil(t, sset.Spec.Template.Spec.Containers[0].StartupProbe)
+		require.Equal(t, test.expectedStartupPeriodSeconds, sset.Spec.Template.Spec.Containers[0].StartupProbe.PeriodSeconds)
+		require.Equal(t, test.expectedStartupFailureThreshold, sset.Spec.Template.Spec.Containers[0].StartupProbe.FailureThreshold)
+	}
+}
+
+func TestIfThanosVersionDontHaveHttpClientFlag(t *testing.T) {
+	version := "v0.23.0"
+
+	for _, tc := range []struct {
+		name string
+		spec monitoringv1.PrometheusSpec
+	}{
+		{
+			name: "default",
+			spec: monitoringv1.PrometheusSpec{},
+		},
+		{
+			name: "Thanos sidecar",
+			spec: monitoringv1.PrometheusSpec{
+				Thanos: &monitoringv1.ThanosSpec{
+					Version: &version,
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{Spec: tc.spec})
+			require.NoError(t, err)
+			for _, c := range sset.Spec.Template.Spec.Containers {
+				for _, arg := range c.Args {
+					require.NotContains(t, arg, "http-client", "Expecting http-client flag to not be present in Thanos sidecar")
+				}
+			}
+		})
+	}
+}
+
+func TestThanosWithPrometheusHTTPClientConfigFile(t *testing.T) {
+	version := "0.24.0"
+
+	for _, tc := range []struct {
+		name string
+		spec monitoringv1.PrometheusSpec
+	}{
+		{
+			name: "thanos sidecar with prometheus.http-client-file",
+			spec: monitoringv1.PrometheusSpec{
+				Thanos: &monitoringv1.ThanosSpec{
+					Version: &version,
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := monitoringv1.Prometheus{Spec: tc.spec}
+			sset, err := makeStatefulSetFromPrometheus(p)
+			require.NoError(t, err)
+			for _, v := range sset.Spec.Template.Spec.Volumes {
+				if v.Name == thanosPrometheusHTTPClientConfigSecretNameSuffix {
+					require.Equal(t, v.VolumeSource.Secret.SecretName, thanosPrometheusHTTPClientConfigSecretName(&p))
+				}
+			}
+			for _, c := range sset.Spec.Template.Spec.Containers {
+				if c.Name == "thanos-sidecar" {
+					require.NotEmpty(t, c.VolumeMounts)
+					require.Equal(t, thanosPrometheusHTTPClientConfigSecretNameSuffix, c.VolumeMounts[0].Name)
+				}
+			}
+		})
+	}
+}
+
+func TestAutomountServiceAccountToken(t *testing.T) {
+	for _, tc := range []struct {
+		name                         string
+		automountServiceAccountToken *bool
+		expectedValue                bool
+	}{
+		{
+			name:                         "automountServiceAccountToken not set",
+			automountServiceAccountToken: nil,
+			expectedValue:                true,
+		},
+		{
+			name:                         "automountServiceAccountToken set to true",
+			automountServiceAccountToken: new(true),
+			expectedValue:                true,
+		},
+		{
+			name:                         "automountServiceAccountToken set to false",
+			automountServiceAccountToken: new(false),
+			expectedValue:                false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				ObjectMeta: metav1.ObjectMeta{},
+				Spec: monitoringv1.PrometheusSpec{
+					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+						AutomountServiceAccountToken: tc.automountServiceAccountToken,
+					},
+				},
+			})
+			require.NoError(t, err)
+
+			require.NotNil(t, sset.Spec.Template.Spec.AutomountServiceAccountToken, "expected automountServiceAccountToken to be set")
+
+			require.Equal(t, tc.expectedValue, *sset.Spec.Template.Spec.AutomountServiceAccountToken, "expected automountServiceAccountToken to be %v", tc.expectedValue)
+		})
+	}
+}
+
+func TestDNSPolicyAndDNSConfig(t *testing.T) {
+	tests := []struct {
+		name              string
+		dnsPolicy         corev1.DNSPolicy
+		dnsConfig         *corev1.PodDNSConfig
+		expectedDNSPolicy corev1.DNSPolicy
+		expectedDNSConfig *corev1.PodDNSConfig
+	}{
+		{
+			name:              "Default DNSPolicy and DNSConfig",
+			dnsPolicy:         corev1.DNSClusterFirst,
+			dnsConfig:         nil,
+			expectedDNSPolicy: corev1.DNSClusterFirst,
+			expectedDNSConfig: nil,
+		},
+		{
+			name:              "Custom DNSPolicy",
+			dnsPolicy:         corev1.DNSDefault,
+			dnsConfig:         nil,
+			expectedDNSPolicy: corev1.DNSDefault,
+			expectedDNSConfig: nil,
+		},
+		{
+			name:      "Custom DNSConfig",
+			dnsPolicy: corev1.DNSClusterFirst,
+			dnsConfig: &corev1.PodDNSConfig{
+				Nameservers: []string{"8.8.8.8", "8.8.4.4"},
+				Searches:    []string{"custom.svc.cluster.local"},
+			},
+			expectedDNSPolicy: corev1.DNSClusterFirst,
+			expectedDNSConfig: &corev1.PodDNSConfig{
+				Nameservers: []string{"8.8.8.8", "8.8.4.4"},
+				Searches:    []string{"custom.svc.cluster.local"},
+			},
+		},
+		{
+			name:      "Custom DNS Policy with Search Domains",
+			dnsPolicy: corev1.DNSDefault,
+			dnsConfig: &corev1.PodDNSConfig{
+				Searches: []string{"kitsos.com", "kitsos.org"},
+			},
+			expectedDNSPolicy: corev1.DNSDefault,
+			expectedDNSConfig: &corev1.PodDNSConfig{
+				Searches: []string{"kitsos.com", "kitsos.org"},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			monitoringDNSPolicyPtr := new(monitoringv1.DNSPolicy(test.dnsPolicy))
+
+			var monitoringDNSConfig *monitoringv1.PodDNSConfig
+			if test.dnsConfig != nil {
+				monitoringDNSConfig = &monitoringv1.PodDNSConfig{
+					Nameservers: test.dnsConfig.Nameservers,
+					Searches:    test.dnsConfig.Searches,
+				}
+			}
+
+			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				ObjectMeta: metav1.ObjectMeta{},
+				Spec: monitoringv1.PrometheusSpec{
+					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+						DNSPolicy: monitoringDNSPolicyPtr,
+						DNSConfig: monitoringDNSConfig,
+					},
+				},
+			})
+			require.NoError(t, err)
+
+			require.Equal(t, test.expectedDNSPolicy, sset.Spec.Template.Spec.DNSPolicy, "expected DNSPolicy to match, want %v, got %v", test.expectedDNSPolicy, sset.Spec.Template.Spec.DNSPolicy)
+			if test.expectedDNSConfig != nil {
+				require.NotNil(t, sset.Spec.Template.Spec.DNSConfig, "expected DNSConfig to be set")
+				require.Equal(t, test.expectedDNSConfig.Nameservers, sset.Spec.Template.Spec.DNSConfig.Nameservers, "expected DNSConfig Nameservers to match, want %v, got %v", test.expectedDNSConfig.Nameservers, sset.Spec.Template.Spec.DNSConfig.Nameservers)
+				require.Equal(t, test.expectedDNSConfig.Searches, sset.Spec.Template.Spec.DNSConfig.Searches, "expected DNSConfig Searches to match, want %v, got %v", test.expectedDNSConfig.Searches, sset.Spec.Template.Spec.DNSConfig.Searches)
+			} else {
+				require.Nil(t, sset.Spec.Template.Spec.DNSConfig, "expected DNSConfig to be nil")
+			}
+		})
+	}
+}
+
+func TestStatefulSetenableServiceLinks(t *testing.T) {
+	tests := []struct {
+		enableServiceLinks         *bool
+		expectedEnableServiceLinks *bool
+	}{
+		{enableServiceLinks: new(false), expectedEnableServiceLinks: new(false)},
+		{enableServiceLinks: new(true), expectedEnableServiceLinks: new(true)},
+		{enableServiceLinks: nil, expectedEnableServiceLinks: nil},
+	}
+
+	for _, test := range tests {
+		sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+			Spec: monitoringv1.PrometheusSpec{
+				CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+					EnableServiceLinks: test.enableServiceLinks,
+				},
+			},
+		})
+		require.NoError(t, err)
+
+		if test.expectedEnableServiceLinks != nil {
+			require.NotNil(t, sset.Spec.Template.Spec.EnableServiceLinks, "expected enableServiceLinks to be non-nil")
+			require.Equal(t, *test.expectedEnableServiceLinks, *sset.Spec.Template.Spec.EnableServiceLinks, "expected enableServiceLinks to match")
+		} else {
+			require.Nil(t, sset.Spec.Template.Spec.EnableServiceLinks, "expected enableServiceLinks to be nil")
+		}
+	}
+}
+
+func TestStatefulPodManagementPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		podManagementPolicy *monitoringv1.PodManagementPolicyType
+		exp                 appsv1.PodManagementPolicyType
+	}{
+		{
+			podManagementPolicy: nil,
+			exp:                 appsv1.ParallelPodManagement,
+		},
+		{
+			podManagementPolicy: ptr.To(monitoringv1.ParallelPodManagement),
+			exp:                 appsv1.ParallelPodManagement,
+		},
+		{
+			podManagementPolicy: ptr.To(monitoringv1.OrderedReadyPodManagement),
+			exp:                 appsv1.OrderedReadyPodManagement,
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				Spec: monitoringv1.PrometheusSpec{
+					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+						PodManagementPolicy: tc.podManagementPolicy,
+					},
+				},
+			})
+
+			require.NoError(t, err)
+			require.Equal(t, tc.exp, sset.Spec.PodManagementPolicy)
+		})
+	}
+}
+
+func TestStatefulSetUpdateStrategy(t *testing.T) {
+	for _, tc := range []struct {
+		updateStrategy *monitoringv1.StatefulSetUpdateStrategy
+		exp            appsv1.StatefulSetUpdateStrategy
+	}{
+		{
+			updateStrategy: nil,
+			exp: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+			},
+		},
+		{
+			updateStrategy: &monitoringv1.StatefulSetUpdateStrategy{
+				Type: monitoringv1.RollingUpdateStatefulSetStrategyType,
+			},
+			exp: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+			},
+		},
+		{
+			updateStrategy: &monitoringv1.StatefulSetUpdateStrategy{
+				Type: monitoringv1.RollingUpdateStatefulSetStrategyType,
+				RollingUpdate: &monitoringv1.RollingUpdateStatefulSetStrategy{
+					MaxUnavailable: new(intstr.FromInt(1)),
+				},
+			},
+			exp: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{
+					MaxUnavailable: new(intstr.FromInt(1)),
+				},
+			},
+		},
+		{
+			updateStrategy: &monitoringv1.StatefulSetUpdateStrategy{
+				Type: monitoringv1.OnDeleteStatefulSetStrategyType,
+			},
+			exp: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
+			},
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			sset, err := makeStatefulSetFromPrometheus(monitoringv1.Prometheus{
+				Spec: monitoringv1.PrometheusSpec{
+					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+						UpdateStrategy: tc.updateStrategy,
+					},
+				},
+			})
+
+			require.NoError(t, err)
+			require.Equal(t, tc.exp, sset.Spec.UpdateStrategy)
+		})
+	}
+}
+
+func TestConfigReloaderTopologyZoneEnvVar(t *testing.T) {
+	topologyMode := monitoringv1.TopologyShardingStrategyMode
+
+	for _, tc := range []struct {
+		name             string
+		shardingStrategy *monitoringv1.ShardingStrategy
+		shardIndex       int32
+		expectedZone     string
+	}{
+		{
+			name: "shard 0 gets zone-a",
+			shardingStrategy: &monitoringv1.ShardingStrategy{
+				Mode: new(topologyMode),
+				Topology: &monitoringv1.TopologyShardingStrategy{
+					Values: []string{"zone-a", "zone-b"},
+				},
+			},
+			shardIndex:   0,
+			expectedZone: "zone-a",
+		},
+		{
+			name: "shard 1 gets zone-b",
+			shardingStrategy: &monitoringv1.ShardingStrategy{
+				Mode: new(topologyMode),
+				Topology: &monitoringv1.TopologyShardingStrategy{
+					Values: []string{"zone-a", "zone-b"},
+				},
+			},
+			shardIndex:   1,
+			expectedZone: "zone-b",
+		},
+		{
+			name:             "no topology mode means no zone env var",
+			shardingStrategy: nil,
+			shardIndex:       0,
+			expectedZone:     "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := monitoringv1.Prometheus{
+				Spec: monitoringv1.PrometheusSpec{
+					CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+						ShardingStrategy: tc.shardingStrategy,
+					},
+				},
+			}
+
+			logger := prompkg.NewLogger()
+			cg, err := prompkg.NewConfigGenerator(logger, &p, prompkg.WithPrometheusTopologySharding())
+			require.NoError(t, err)
+
+			sset, err := makeStatefulSet(
+				"test",
+				&p,
+				defaultTestConfig,
+				cg,
+				nil,
+				"",
+				tc.shardIndex,
+				&operator.ShardedSecret{},
+			)
+			require.NoError(t, err)
+
+			checkZoneEnvVar := func(containers []corev1.Container, containerName string) {
+				t.Helper()
+				for _, c := range containers {
+					if c.Name != containerName {
+						continue
+					}
+					var found bool
+					for _, env := range c.Env {
+						if env.Name == operator.TopologyZoneEnvVar {
+							assert.Equal(t, tc.expectedZone, env.Value)
+							found = true
+						}
+					}
+					if tc.expectedZone == "" {
+						assert.False(t, found, "unexpected %s env var in %s", operator.TopologyZoneEnvVar, containerName)
+					} else {
+						assert.True(t, found, "missing %s env var in %s", operator.TopologyZoneEnvVar, containerName)
+					}
+					return
+				}
+				t.Errorf("container %q not found", containerName)
+			}
+
+			checkZoneEnvVar(sset.Spec.Template.Spec.Containers, "config-reloader")
+			checkZoneEnvVar(sset.Spec.Template.Spec.InitContainers, "init-config-reloader")
+		})
 	}
 }

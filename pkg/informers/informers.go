@@ -1,4 +1,4 @@
-// Copyright 2020 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,17 +15,18 @@
 package informers
 
 import (
-	"sort"
+	"fmt"
+	"slices"
 
-	"github.com/pkg/errors"
-	"github.com/prometheus-operator/prometheus-operator/pkg/listwatch"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/prometheus-operator/prometheus-operator/pkg/listwatch"
 )
 
 // InformLister is the interface that both exposes a shared index informer
@@ -45,6 +46,7 @@ type FactoriesForNamespaces interface {
 // ForResource contains a slice of InformLister for a concrete resource type,
 // one per namespace.
 type ForResource struct {
+	gr        schema.GroupResource
 	informers []InformLister
 }
 
@@ -55,22 +57,80 @@ type ForResource struct {
 // It takes a namespace aware informer factory, wrapped in a FactoriesForNamespaces interface
 // that is able to instantiate an informer for a given namespace.
 func NewInformersForResource(ifs FactoriesForNamespaces, resource schema.GroupVersionResource) (*ForResource, error) {
+	return NewInformersForResourceWithTransform(ifs, resource, nil)
+}
+
+func NewInformersForResourceWithTransform(ifs FactoriesForNamespaces, resource schema.GroupVersionResource, handler cache.TransformFunc) (*ForResource, error) {
 	namespaces := ifs.Namespaces().UnsortedList()
-	sort.Strings(namespaces)
+	slices.Sort(namespaces)
 
 	informers := make([]InformLister, 0, len(namespaces))
 
 	for _, ns := range namespaces {
 		informer, err := ifs.ForResource(ns, resource)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error getting informer in namespace %q for resource %v", ns, resource)
+			return nil, fmt.Errorf("error getting informer in namespace %q for resource %v: %w", ns, resource, err)
+		}
+		if handler != nil {
+			if err := informer.Informer().SetTransform(handler); err != nil {
+				return nil, fmt.Errorf("error setting transform in namespace %q for resource %v: %w", ns, resource, err)
+			}
 		}
 		informers = append(informers, informer)
 	}
 
 	return &ForResource{
+		gr:        resource.GroupResource(),
 		informers: informers,
 	}, nil
+}
+
+func partialObjectMetadataStrip(obj any) (*metav1.PartialObjectMetadata, error) {
+	partialMeta, ok := obj.(*metav1.PartialObjectMetadata)
+	if !ok {
+		// Don't do anything if the cast isn't successful.
+		// The object might be of type "cache.DeletedFinalStateUnknown".
+		return nil, fmt.Errorf("invalid object type: %T", obj)
+	}
+
+	partialMeta.Annotations = nil
+	partialMeta.Labels = nil
+	partialMeta.ManagedFields = nil
+	partialMeta.Finalizers = nil
+	partialMeta.OwnerReferences = nil
+
+	return partialMeta, nil
+}
+
+// PartialObjectMetadataStrip removes the following fields from PartialObjectMetadata objects:
+// * Annotations
+// * Labels
+// * ManagedFields
+// * Finalizers
+// * OwnerReferences.
+//
+// It also sets the TypeMeta field on the PartialObjectMetadata objects so
+// consumers can introspect the object's type.
+//
+// If the passed object isn't of type *v1.PartialObjectMetadata, it is returned unmodified.
+//
+// It matches the cache.TransformFunc type and can be used by informers
+// watching PartialObjectMetadata objects to reduce memory consumption.
+// See https://pkg.go.dev/k8s.io/client-go@v0.29.1/tools/cache#TransformFunc for details.
+func PartialObjectMetadataStrip(gvk schema.GroupVersionKind) cache.TransformFunc {
+	return func(obj any) (any, error) {
+		partialMeta, err := partialObjectMetadataStrip(obj)
+		if err != nil {
+			return obj, nil
+		}
+
+		partialMeta.TypeMeta = metav1.TypeMeta{
+			Kind:       gvk.Kind,
+			APIVersion: gvk.GroupVersion().String(),
+		}
+
+		return partialMeta, nil
+	}
 }
 
 // Start starts all underlying informers, passing the given stop channel to each of them.
@@ -131,13 +191,10 @@ func (w *ForResource) ListAllByNamespace(namespace string, selector labels.Selec
 }
 
 // Get invokes all wrapped informers and returns the first found runtime object.
-// It returns the first ocured error.
+// It returns a NotFound error if the object isn't found in any informer.
 func (w *ForResource) Get(name string) (runtime.Object, error) {
-	var err error
-
 	for _, inf := range w.informers {
-		var ret runtime.Object
-		ret, err = inf.Lister().Get(name)
+		ret, err := inf.Lister().Get(name)
 		if apierrors.IsNotFound(err) {
 			continue
 		}
@@ -148,7 +205,7 @@ func (w *ForResource) Get(name string) (runtime.Object, error) {
 		return ret, nil
 	}
 
-	return nil, err
+	return nil, apierrors.NewNotFound(w.gr, name)
 }
 
 // newInformerOptions returns a list option tweak function and a list of namespaces
@@ -158,18 +215,18 @@ func (w *ForResource) Get(name string) (runtime.Object, error) {
 // then it returns it and a tweak function filtering denied namespaces using a field selector.
 //
 // Else, denied namespaces are ignored and just the set of allowed namespaces is returned.
-func newInformerOptions(allowedNamespaces, deniedNamespaces map[string]struct{}, tweaks func(*v1.ListOptions)) (func(*v1.ListOptions), []string) {
+func newInformerOptions(allowedNamespaces, deniedNamespaces map[string]struct{}, tweaks func(*metav1.ListOptions)) (func(*metav1.ListOptions), []string) {
 	if tweaks == nil {
-		tweaks = func(*v1.ListOptions) {} // nop
+		tweaks = func(*metav1.ListOptions) {} // nop
 	}
 
 	var namespaces []string
 
 	if listwatch.IsAllNamespaces(allowedNamespaces) {
-		return func(options *v1.ListOptions) {
+		return func(options *metav1.ListOptions) {
 			tweaks(options)
 			listwatch.DenyTweak(options, "metadata.namespace", deniedNamespaces)
-		}, []string{v1.NamespaceAll}
+		}, []string{metav1.NamespaceAll}
 	}
 
 	for ns := range allowedNamespaces {

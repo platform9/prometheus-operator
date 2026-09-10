@@ -1,4 +1,4 @@
-// Copyright 2016 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,11 +19,12 @@ import (
 	"fmt"
 	"time"
 
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 )
 
 func (f *Framework) MakeBasicRule(ns, name string, groups []monitoringv1.RuleGroup) *monitoringv1.PrometheusRule {
@@ -43,19 +44,23 @@ func (f *Framework) MakeBasicRule(ns, name string, groups []monitoringv1.RuleGro
 
 func (f *Framework) CreateRule(ctx context.Context, ns string, ar *monitoringv1.PrometheusRule) (*monitoringv1.PrometheusRule, error) {
 	var (
-		rule *monitoringv1.PrometheusRule
-		err  error
+		rule      *monitoringv1.PrometheusRule
+		createErr error
 	)
 
-	err = wait.Poll(time.Second, time.Minute, func() (bool, error) {
-		rule, err = f.MonClientV1.PrometheusRules(ns).Create(ctx, ar, metav1.CreateOptions{})
-		if err != nil {
-			return false, err
+	err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, false, func(ctx context.Context) (bool, error) {
+		rule, createErr = f.MonClientV1.PrometheusRules(ns).Create(ctx, ar, metav1.CreateOptions{})
+		if createErr != nil {
+			return false, nil
 		}
+
 		return true, nil
 	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", err, createErr)
+	}
 
-	return rule, err
+	return rule, nil
 }
 
 func (f *Framework) GetRule(ctx context.Context, ns, name string) (*monitoringv1.PrometheusRule, error) {
@@ -114,7 +119,7 @@ func (f *Framework) MakeAndCreateInvalidRule(ctx context.Context, ns, name, aler
 // WaitForRule waits for a rule file with a given name to exist in a given
 // namespace.
 func (f *Framework) WaitForRule(ctx context.Context, ns, name string) error {
-	return wait.Poll(time.Second, f.DefaultTimeout, func() (bool, error) {
+	return wait.PollUntilContextTimeout(ctx, time.Second, f.DefaultTimeout, false, func(ctx context.Context) (bool, error) {
 		_, err := f.MonClientV1.PrometheusRules(ns).Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return false, nil
@@ -131,7 +136,7 @@ func (f *Framework) UpdateRule(ctx context.Context, ns string, ar *monitoringv1.
 		err  error
 	)
 
-	err = wait.Poll(time.Second, time.Minute, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, false, func(ctx context.Context) (bool, error) {
 		rule, err = f.MonClientV1.PrometheusRules(ns).Update(ctx, ar, metav1.UpdateOptions{})
 		if err != nil {
 			return false, fmt.Errorf("updating %v RuleFile failed: %v", ar.Name, err)
@@ -149,4 +154,50 @@ func (f *Framework) DeleteRule(ctx context.Context, ns string, r string) error {
 	}
 
 	return nil
+}
+
+func (f *Framework) WaitForRuleCondition(ctx context.Context, pr *monitoringv1.PrometheusRule, workload metav1.Object, resource string, conditionType monitoringv1.ConditionType, conditionStatus monitoringv1.ConditionStatus, timeout time.Duration) (*monitoringv1.PrometheusRule, error) {
+	var current *monitoringv1.PrometheusRule
+
+	if err := f.WaitForConfigResourceCondition(
+		ctx,
+		func(ctx context.Context) ([]monitoringv1.WorkloadBinding, error) {
+			var err error
+			current, err = f.MonClientV1.PrometheusRules(pr.Namespace).Get(ctx, pr.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			return current.Status.Bindings, nil
+		},
+		workload,
+		resource,
+		conditionType,
+		conditionStatus,
+		timeout,
+	); err != nil {
+		return nil, fmt.Errorf("prometheusRule status %v/%v failed to reach expected condition: %w", pr.Namespace, pr.Name, err)
+	}
+	return current, nil
+}
+
+func (f *Framework) WaitForRuleWorkloadBindingCleanup(ctx context.Context, pm *monitoringv1.PrometheusRule, workload metav1.Object, resource string, timeout time.Duration) (*monitoringv1.PrometheusRule, error) {
+	var current *monitoringv1.PrometheusRule
+
+	if err := f.WaitForConfigResWorkloadBindingCleanup(
+		ctx,
+		func(ctx context.Context) ([]monitoringv1.WorkloadBinding, error) {
+			var err error
+			current, err = f.MonClientV1.PrometheusRules(pm.Namespace).Get(ctx, pm.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			return current.Status.Bindings, nil
+		},
+		workload,
+		resource,
+		timeout,
+	); err != nil {
+		return nil, fmt.Errorf("prometheusRule status %v/%v failed to reach expected condition: %w", pm.Namespace, pm.Name, err)
+	}
+	return current, nil
 }

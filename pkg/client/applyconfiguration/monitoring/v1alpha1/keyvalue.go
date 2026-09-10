@@ -16,14 +16,20 @@
 
 package v1alpha1
 
-// KeyValueApplyConfiguration represents an declarative configuration of the KeyValue type for use
+// KeyValueApplyConfiguration represents a declarative configuration of the KeyValue type for use
 // with apply.
+//
+// KeyValue defines a (key, value) tuple.
 type KeyValueApplyConfiguration struct {
-	Key   *string `json:"key,omitempty"`
+	// key defines the key of the tuple.
+	// This is the identifier or name part of the key-value pair.
+	Key *string `json:"key,omitempty"`
+	// value defines the value of the tuple.
+	// This is the data or content associated with the key.
 	Value *string `json:"value,omitempty"`
 }
 
-// KeyValueApplyConfiguration constructs an declarative configuration of the KeyValue type for use with
+// KeyValueApplyConfiguration constructs a declarative configuration of the KeyValue type for use with
 // apply.
 func KeyValue() *KeyValueApplyConfiguration {
 	return &KeyValueApplyConfiguration{}

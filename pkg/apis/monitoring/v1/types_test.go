@@ -1,4 +1,4 @@
-// Copyright 2018 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func TestValidateSecretOrConfigMap(t *testing.T) {
@@ -39,11 +40,13 @@ func TestValidateSecretOrConfigMap(t *testing.T) {
 
 func TestValidateSafeTLSConfig(t *testing.T) {
 	for _, tc := range []struct {
+		name   string
 		config *SafeTLSConfig
-		err    bool
+
+		err bool
 	}{
 		{
-			// CA, Cert, and KeySecret.
+			name: "ca, cert and keySecret",
 			config: &SafeTLSConfig{
 				CA:        SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
 				Cert:      SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
@@ -52,7 +55,7 @@ func TestValidateSafeTLSConfig(t *testing.T) {
 			err: false,
 		},
 		{
-			// Without CA cert.
+			name: "cert and keySecret",
 			config: &SafeTLSConfig{
 				Cert:      SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
 				KeySecret: &v1.SecretKeySelector{},
@@ -60,7 +63,7 @@ func TestValidateSafeTLSConfig(t *testing.T) {
 			err: false,
 		},
 		{
-			// Without Cert.
+			name: "ca and keySecret",
 			config: &SafeTLSConfig{
 				CA:        SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
 				KeySecret: &v1.SecretKeySelector{},
@@ -68,21 +71,58 @@ func TestValidateSafeTLSConfig(t *testing.T) {
 			err: true,
 		},
 		{
-			// Without KeySecret.
+			name: "ca and cert",
 			config: &SafeTLSConfig{
-				CA:   SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
-				Cert: SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+				CA: SecretOrConfigMap{
+					Secret: &v1.SecretKeySelector{},
+				},
+				Cert: SecretOrConfigMap{
+					Secret: &v1.SecretKeySelector{},
+				},
 			},
 			err: true,
+		},
+		{
+			name: "maxVersion more than minVersion",
+			config: &SafeTLSConfig{
+				MinVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion10),
+				MaxVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion13),
+			},
+			err: false,
+		},
+		{
+			name: "maxVersion equal to minVersion",
+			config: &SafeTLSConfig{
+				MinVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion13),
+				MaxVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion13),
+			},
+			err: false,
+		},
+		{
+			name: "maxVersion is less than minVersion",
+			config: &SafeTLSConfig{
+				MinVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion13),
+				MaxVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion10),
+			},
+			err: true,
+		},
+		{
+			name:   "SafeTLSConfig nil",
+			config: nil,
+			err:    false,
 		},
 	} {
-		t.Run("", func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			err := tc.config.Validate()
-			if tc.err && err == nil {
-				t.Fatalf("expected validation of %+v to fail, but got no error", tc.config)
+			if tc.err {
+				if err == nil {
+					t.Fatal("expected error but got none")
+				}
+				return
 			}
-			if !tc.err && err != nil {
-				t.Fatalf("expected validation of %+v not to fail, err: %s", tc.config, err)
+
+			if err != nil {
+				t.Fatalf("expected no error but got: %s", err)
 			}
 		})
 	}
@@ -90,47 +130,59 @@ func TestValidateSafeTLSConfig(t *testing.T) {
 
 func TestValidateTLSConfig(t *testing.T) {
 	for _, tc := range []struct {
+		name   string
 		config *TLSConfig
-		err    bool
+
+		err bool
 	}{
 		{
-			// CAFile, CertFile, and KeyFile.
+			name: "caFile, certFile and keyFile",
 			config: &TLSConfig{
-				CAFile:   "cafile",
-				CertFile: "certfile",
-				KeyFile:  "keyfile",
+				TLSFilesConfig: TLSFilesConfig{
+					CAFile:   "cafile",
+					CertFile: "certfile",
+					KeyFile:  "keyfile",
+				},
 			},
 			err: false,
 		},
 		{
-			// Without CAFile.
+			name: "certFile and keyFile",
 			config: &TLSConfig{
-				CertFile: "certfile",
-				KeyFile:  "keyfile",
+				TLSFilesConfig: TLSFilesConfig{
+					CertFile: "certfile",
+					KeyFile:  "keyfile",
+				},
 			},
 			err: false,
 		},
 		{
-			// Without CertFile.
+			name: "caFile and keyFile",
 			config: &TLSConfig{
-				CAFile:  "cafile",
-				KeyFile: "keyfile",
+				TLSFilesConfig: TLSFilesConfig{
+					CAFile:  "cafile",
+					KeyFile: "keyfile",
+				},
 			},
 			err: true,
 		},
 		{
-			// Without KeyFile.
+			name: "caFile and certFile",
 			config: &TLSConfig{
-				CAFile:   "cafile",
-				CertFile: "certfile",
+				TLSFilesConfig: TLSFilesConfig{
+					CAFile:   "cafile",
+					CertFile: "certfile",
+				},
 			},
 			err: true,
 		},
 		{
-			// CertSecret and KeyFile.
+			name: "caFile, cert and keyFile",
 			config: &TLSConfig{
-				CAFile:  "cafile",
-				KeyFile: "keyfile",
+				TLSFilesConfig: TLSFilesConfig{
+					CAFile:  "cafile",
+					KeyFile: "keyfile",
+				},
 				SafeTLSConfig: SafeTLSConfig{
 					Cert: SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
 				},
@@ -138,10 +190,12 @@ func TestValidateTLSConfig(t *testing.T) {
 			err: false,
 		},
 		{
-			// CertFile and KeySecret.
+			name: "caFile, certFile and keySecret",
 			config: &TLSConfig{
-				CAFile:   "cafile",
-				CertFile: "certfile",
+				TLSFilesConfig: TLSFilesConfig{
+					CAFile:   "cafile",
+					CertFile: "certfile",
+				},
 				SafeTLSConfig: SafeTLSConfig{
 					KeySecret: &v1.SecretKeySelector{},
 				},
@@ -149,7 +203,7 @@ func TestValidateTLSConfig(t *testing.T) {
 			err: false,
 		},
 		{
-			// CA, Cert, and KeySecret.
+			name: "ca, cert and keySecret",
 			config: &TLSConfig{
 				SafeTLSConfig: SafeTLSConfig{
 					CA:        SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
@@ -160,7 +214,7 @@ func TestValidateTLSConfig(t *testing.T) {
 			err: false,
 		},
 		{
-			// Without CA and CAFile.
+			name: "cert and keySecret",
 			config: &TLSConfig{
 				SafeTLSConfig: SafeTLSConfig{
 					Cert:      SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
@@ -170,7 +224,7 @@ func TestValidateTLSConfig(t *testing.T) {
 			err: false,
 		},
 		{
-			// Without Cert and CertFile.
+			name: "ca and keySecret",
 			config: &TLSConfig{
 				SafeTLSConfig: SafeTLSConfig{
 					CA:        SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
@@ -180,7 +234,7 @@ func TestValidateTLSConfig(t *testing.T) {
 			err: true,
 		},
 		{
-			// Without KeySecret and KeyFile.
+			name: "ca and cert",
 			config: &TLSConfig{
 				SafeTLSConfig: SafeTLSConfig{
 					CA:   SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
@@ -189,14 +243,161 @@ func TestValidateTLSConfig(t *testing.T) {
 			},
 			err: true,
 		},
+		{
+			name: "maxVersion more than minVersion",
+			config: &TLSConfig{
+				SafeTLSConfig: SafeTLSConfig{
+					MinVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion10),
+					MaxVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion13),
+				},
+			},
+			err: false,
+		},
+		{
+			name: "maxVersion equal to minVersion",
+			config: &TLSConfig{
+				SafeTLSConfig: SafeTLSConfig{
+					MinVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion13),
+					MaxVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion13),
+				},
+			},
+			err: false,
+		},
+		{
+			name: "maxVersion is less than minVersion",
+			config: &TLSConfig{
+				SafeTLSConfig: SafeTLSConfig{
+					MinVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion13),
+					MaxVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion10),
+				},
+			},
+			err: true,
+		},
+		{
+			name:   "tlsconfig nil",
+			config: nil,
+			err:    false,
+		},
 	} {
-		t.Run("", func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			err := tc.config.Validate()
-			if tc.err && err == nil {
-				t.Fatalf("expected validation of %+v to fail, but got no error", tc.config)
+			if tc.err {
+				if err == nil {
+					t.Fatal("expected error but got none")
+				}
+				return
 			}
-			if !tc.err && err != nil {
-				t.Fatalf("expected validation of %+v not to fail, err: %s", tc.config, err)
+
+			if err != nil {
+				t.Fatalf("expected no error but got: %s", err)
+			}
+		})
+	}
+}
+
+func TestValidateWebTlsConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config *WebTLSConfig
+		err    bool
+	}{
+		{
+			name: "caFile, certFile and keyFile",
+			config: &WebTLSConfig{
+				ClientCAFile: func(s string) *string { return &s }("cafile"),
+				CertFile:     func(s string) *string { return &s }("certfile"),
+				KeyFile:      func(s string) *string { return &s }("keyfile"),
+			},
+		},
+		{
+			name: "certFile and keyFile",
+			config: &WebTLSConfig{
+				CertFile: func(s string) *string { return &s }("certfile"),
+				KeyFile:  func(s string) *string { return &s }("keyfile"),
+			},
+		},
+		{
+			name: "caFile and keyFile",
+			config: &WebTLSConfig{
+				ClientCAFile: func(s string) *string { return &s }("cafile"),
+				KeyFile:      func(s string) *string { return &s }("keyfile"),
+			},
+			err: true,
+		},
+		{
+			name: "caFile and certFile",
+			config: &WebTLSConfig{
+				ClientCAFile: func(s string) *string { return &s }("cafile"),
+				CertFile:     func(s string) *string { return &s }("certfile"),
+			},
+			err: true,
+		},
+		{
+			name: "caFile, cert and keyFile",
+			config: &WebTLSConfig{
+				ClientCAFile: func(s string) *string { return &s }("cafile"),
+				KeyFile:      func(s string) *string { return &s }("keyfile"),
+				Cert:         SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+			},
+		},
+		{
+			name: "caFile, certFile and keySecret",
+			config: &WebTLSConfig{
+				ClientCAFile: func(s string) *string { return &s }("cafile"),
+				CertFile:     func(s string) *string { return &s }("certfile"),
+				KeySecret: v1.SecretKeySelector{
+					LocalObjectReference: v1.LocalObjectReference{
+						Name: "test-secret",
+					},
+					Key: "tls.key",
+				},
+			},
+		},
+		{
+			name: "ca, cert and keySecret",
+			config: &WebTLSConfig{
+				Cert:     SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+				ClientCA: SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+				KeySecret: v1.SecretKeySelector{
+					LocalObjectReference: v1.LocalObjectReference{
+						Name: "test-secret",
+					},
+					Key: "tls.key",
+				},
+			},
+		},
+		{
+			name: "cert and keySecret",
+			config: &WebTLSConfig{
+				ClientCA: SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+				KeySecret: v1.SecretKeySelector{
+					LocalObjectReference: v1.LocalObjectReference{
+						Name: "test-secret",
+					},
+					Key: "tls.key",
+				},
+			},
+			err: true,
+		},
+		{
+			name: "ca and cert",
+			config: &WebTLSConfig{
+				ClientCA: SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+				Cert:     SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+			},
+			err: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.config.Validate()
+			if tc.err {
+				if err == nil {
+					t.Fatal("expected error but got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error but got: %s", err)
 			}
 		})
 	}
@@ -265,10 +466,171 @@ func TestValidateAuthorization(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.config.Validate()
 			if tc.err && err == nil {
-				t.Fatalf("expected validation of %+v to fail, but got no error", tc.config)
+				t.Fatal("expected error but got none")
 			}
+
 			if !tc.err && err != nil {
-				t.Fatalf("expected validation of %+v not to fail, err: %s", tc.config, err)
+				t.Fatalf("expected no error but got: %s", err)
+			}
+		})
+	}
+}
+
+func TestValidateOAuth2(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config *OAuth2
+		err    bool
+	}{
+		{
+			name: "SafeTLSConfig nil",
+			config: &OAuth2{
+				ClientID:     SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+				ClientSecret: v1.SecretKeySelector{},
+				TokenURL:     "http://tokenurl.org",
+				TLSConfig:    nil,
+			},
+			err: false,
+		},
+		{
+			name: "SafeTLSConfig not nil",
+			config: &OAuth2{
+				ClientID:     SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+				ClientSecret: v1.SecretKeySelector{},
+				TokenURL:     "http://tokenurl.org",
+				TLSConfig: &SafeTLSConfig{
+					MinVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion10),
+					MaxVersion: func(v TLSVersion) *TLSVersion { return &v }(TLSVersion13),
+				},
+			},
+			err: false,
+		},
+		{
+			name: "valid ProxyConfig with proxyUrl",
+			config: &OAuth2{
+				ClientID:     SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+				ClientSecret: v1.SecretKeySelector{},
+				TokenURL:     "http://tokenurl.org",
+				ProxyConfig: ProxyConfig{
+					ProxyURL: new("http://proxy.example.com:8080"),
+				},
+			},
+			err: false,
+		},
+		{
+			name: "valid ProxyConfig with proxyFromEnvironment",
+			config: &OAuth2{
+				ClientID:     SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+				ClientSecret: v1.SecretKeySelector{},
+				TokenURL:     "http://tokenurl.org",
+				ProxyConfig: ProxyConfig{
+					ProxyFromEnvironment: new(true),
+				},
+			},
+			err: false,
+		},
+		{
+			name: "invalid ProxyConfig with proxyFromEnvironment and proxyUrl",
+			config: &OAuth2{
+				ClientID:     SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+				ClientSecret: v1.SecretKeySelector{},
+				TokenURL:     "http://tokenurl.org",
+				ProxyConfig: ProxyConfig{
+					ProxyFromEnvironment: new(true),
+					ProxyURL:             new("http://proxy.example.com:8080"),
+				},
+			},
+			err: true,
+		},
+		{
+			name: "invalid ProxyConfig with noProxy but no proxyUrl",
+			config: &OAuth2{
+				ClientID:     SecretOrConfigMap{Secret: &v1.SecretKeySelector{}},
+				ClientSecret: v1.SecretKeySelector{},
+				TokenURL:     "http://tokenurl.org",
+				ProxyConfig: ProxyConfig{
+					NoProxy: new("localhost"),
+				},
+			},
+			err: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.config.Validate()
+			if tc.err {
+				if err == nil {
+					t.Fatal("expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("expected no error but got: %s", err)
+			}
+		})
+	}
+}
+
+func TestValidateTracingConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config *TracingConfig
+		err    bool
+	}{
+		{
+			name: "TLSConfig nil",
+			config: &TracingConfig{
+				TLSConfig: nil,
+			},
+			err: false,
+		},
+		{
+			name: "SamplingFraction simple value",
+			config: &TracingConfig{
+				SamplingFraction: func(v resource.Quantity) *resource.Quantity { return &v }(resource.MustParse("0.56")),
+			},
+			err: false,
+		},
+		{
+			name: "SamplingFraction > 1",
+			config: &TracingConfig{
+				SamplingFraction: resource.NewQuantity(10, resource.DecimalSI),
+			},
+			err: true,
+		},
+		{
+			name: "SamplingFraction < 0",
+			config: &TracingConfig{
+				SamplingFraction: resource.NewQuantity(-1, resource.DecimalSI),
+			},
+			err: true,
+		},
+		{
+			name: "SamplingFraction == 0",
+			config: &TracingConfig{
+				SamplingFraction: resource.NewQuantity(0, resource.DecimalSI),
+			},
+			err: false,
+		},
+		{
+			name: "SamplingFraction == 1",
+			config: &TracingConfig{
+				SamplingFraction: resource.NewQuantity(1, resource.DecimalSI),
+			},
+			err: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.config.Validate()
+			if tc.err {
+				if err == nil {
+					t.Fatal("expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("expected no error but got: %s", err)
 			}
 		})
 	}

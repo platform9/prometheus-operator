@@ -1,4 +1,4 @@
-// Copyright 2019 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@ package framework
 
 import (
 	"context"
+	"fmt"
 
-	"github.com/pkg/errors"
 	v1 "k8s.io/api/admissionregistration/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,7 +27,7 @@ import (
 func (f *Framework) createOrUpdateMutatingHook(ctx context.Context, certBytes []byte, namespace, source string) (FinalizerFn, error) {
 	hook, err := parseMutatingHookYaml(source)
 	if err != nil {
-		return nil, errors.Wrap(err, "Failed parsing mutating webhook")
+		return nil, fmt.Errorf("failed parsing mutating webhook: %w", err)
 	}
 
 	hook.Webhooks[0].ClientConfig.Service.Namespace = namespace
@@ -35,23 +35,23 @@ func (f *Framework) createOrUpdateMutatingHook(ctx context.Context, certBytes []
 
 	h, err := f.KubeClient.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, hook.Name, metav1.GetOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
-		return nil, errors.Wrapf(err, "failed to get mutating webhook %s", hook.Name)
+		return nil, fmt.Errorf("failed to get mutating webhook %s: %w", hook.Name, err)
 	}
 
 	if apierrors.IsNotFound(err) {
 		// MutatingWebhookConfiguration doesn't exists -> Create
 		_, err = f.KubeClient.AdmissionregistrationV1().MutatingWebhookConfigurations().Create(ctx, hook, metav1.CreateOptions{})
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to create mutating webhook %s", hook.Name)
+			return nil, fmt.Errorf("failed to create mutating webhook %s: %w", hook.Name, err)
 		}
 	} else {
 		// must set this field from existing MutatingWebhookConfiguration to prevent update fail
-		hook.ObjectMeta.ResourceVersion = h.ObjectMeta.ResourceVersion
+		hook.ResourceVersion = h.ResourceVersion
 
 		// MutatingWebhookConfiguration already exists -> Update
 		_, err = f.KubeClient.AdmissionregistrationV1().MutatingWebhookConfigurations().Update(ctx, hook, metav1.UpdateOptions{})
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to update mutating webhook %s", hook.Name)
+			return nil, fmt.Errorf("failed to update mutating webhook %s: %w", hook.Name, err)
 		}
 	}
 
@@ -63,7 +63,7 @@ func (f *Framework) createOrUpdateMutatingHook(ctx context.Context, certBytes []
 func (f *Framework) createOrUpdateValidatingHook(ctx context.Context, certBytes []byte, namespace, source string) (FinalizerFn, error) {
 	hook, err := parseValidatingHookYaml(source)
 	if err != nil {
-		return nil, errors.Wrap(err, "Failed parsing validating webhook")
+		return nil, fmt.Errorf("failed parsing validating webhook: %w", err)
 	}
 
 	hook.Webhooks[0].ClientConfig.Service.Namespace = namespace
@@ -71,23 +71,23 @@ func (f *Framework) createOrUpdateValidatingHook(ctx context.Context, certBytes 
 
 	h, err := f.KubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, hook.Name, metav1.GetOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
-		return nil, errors.Wrapf(err, "failed to get validating webhook %s", hook.Name)
+		return nil, fmt.Errorf("failed to get validating webhook %s: %w", hook.Name, err)
 	}
 
 	if apierrors.IsNotFound(err) {
 		// ValidatingWebhookConfiguration doesn't exists -> Create
 		_, err = f.KubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations().Create(ctx, hook, metav1.CreateOptions{})
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to create validating webhook %s", hook.Name)
+			return nil, fmt.Errorf("failed to create validating webhook %s: %w", hook.Name, err)
 		}
 	} else {
 		// must set this field from existing ValidatingWebhookConfiguration to prevent update fail
-		hook.ObjectMeta.ResourceVersion = h.ObjectMeta.ResourceVersion
+		hook.ResourceVersion = h.ResourceVersion
 
 		// ValidatingWebhookConfiguration already exists -> Update
 		_, err = f.KubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(ctx, hook, metav1.UpdateOptions{})
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to update validating webhook %s", hook.Name)
+			return nil, fmt.Errorf("failed to update validating webhook %s: %w", hook.Name, err)
 		}
 	}
 
@@ -112,7 +112,7 @@ func parseValidatingHookYaml(source string) (*v1.ValidatingWebhookConfiguration,
 
 	resource := v1.ValidatingWebhookConfiguration{}
 	if err := yaml.NewYAMLOrJSONDecoder(manifest, 100).Decode(&resource); err != nil {
-		return nil, errors.Wrapf(err, "failed to decode file %s", source)
+		return nil, fmt.Errorf("failed to decode file %s: %w", source, err)
 	}
 
 	return &resource, nil
@@ -126,7 +126,7 @@ func parseMutatingHookYaml(source string) (*v1.MutatingWebhookConfiguration, err
 
 	resource := v1.MutatingWebhookConfiguration{}
 	if err := yaml.NewYAMLOrJSONDecoder(manifest, 100).Decode(&resource); err != nil {
-		return nil, errors.Wrapf(err, "failed to decode file %s", source)
+		return nil, fmt.Errorf("failed to decode file %s: %w", source, err)
 	}
 
 	return &resource, nil

@@ -1,4 +1,4 @@
-// Copyright 2020 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	certDirectory  = "../test/e2e/remote_write_certs"
+	certDirectory  = "../test/e2e/tls_certs"
 	validityPeriod = 10 * 365 * 24 * time.Hour
 )
 

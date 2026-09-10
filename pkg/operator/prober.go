@@ -1,4 +1,4 @@
-// Copyright 2022 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,12 +16,29 @@ package operator
 
 import (
 	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
-func CurlProber(u string) string {
+// ExecAction returns an ExecAction probing the given URL.
+func ExecAction(u string) *corev1.ExecAction {
+	return &corev1.ExecAction{
+		Command: []string{
+			"sh",
+			"-c",
+			fmt.Sprintf(
+				`if [ -x "$(command -v curl)" ]; then exec %s; elif [ -x "$(command -v wget)" ]; then exec %s; else exit 1; fi`,
+				curlProber(u),
+				wgetProber(u),
+			),
+		},
+	}
+}
+
+func curlProber(u string) string {
 	return fmt.Sprintf("curl --fail %s", u)
 }
 
-func WgetProber(u string) string {
+func wgetProber(u string) string {
 	return fmt.Sprintf("wget -q -O /dev/null %s", u)
 }

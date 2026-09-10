@@ -1,4 +1,4 @@
-// Copyright 2020 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +15,14 @@
 package operator
 
 import (
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 )
 
-func MakeVolumeClaimTemplate(e monitoringv1.EmbeddedPersistentVolumeClaim) *v1.PersistentVolumeClaim {
-	pvc := v1.PersistentVolumeClaim{
+func MakeVolumeClaimTemplate(e monitoringv1.EmbeddedPersistentVolumeClaim) *corev1.PersistentVolumeClaim {
+	pvc := corev1.PersistentVolumeClaim{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: e.APIVersion,
 			Kind:       e.Kind,
@@ -37,13 +38,13 @@ func MakeVolumeClaimTemplate(e monitoringv1.EmbeddedPersistentVolumeClaim) *v1.P
 	return &pvc
 }
 
-// MakeHostAliases converts array of monitoringv1 HostAlias to array of corev1 HostAlias
-func MakeHostAliases(input []monitoringv1.HostAlias) []v1.HostAlias {
+// MakeHostAliases converts array of monitoringv1 HostAlias to array of corev1 HostAlias.
+func MakeHostAliases(input []monitoringv1.HostAlias) []corev1.HostAlias {
 	if len(input) == 0 {
 		return nil
 	}
 
-	output := make([]v1.HostAlias, len(input))
+	output := make([]corev1.HostAlias, len(input))
 
 	for i, in := range input {
 		output[i].Hostnames = in.Hostnames

@@ -1,4 +1,4 @@
-// Copyright 2020 The prometheus-operator Authors
+// Copyright The prometheus-operator Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -52,14 +52,13 @@ func NewKubeInformerFactories(
 // NewMetadataInformerFactory creates metadatainformer factory for kube resources
 // for the given allowed, and denied namespaces (these parameters being mutually exclusive).
 // mdClient, defaultResync, and tweakListOptions are  passed to the underlying informer factory.
-// factories
+// factories.
 func NewMetadataInformerFactory(
 	allowNamespaces, denyNamespaces map[string]struct{},
 	mdClient metadata.Interface,
 	defaultResync time.Duration,
 	tweakListOptions func(*metav1.ListOptions),
 ) FactoriesForNamespaces {
-
 	tweaks, namespaces := newInformerOptions(allowNamespaces, denyNamespaces, tweakListOptions)
 
 	ret := metadataInformersForNamespace{}
